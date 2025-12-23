@@ -11,5 +11,5 @@ plots.py
 embed.py
 generate_queries_vary_m
 CLIP_ex*
-index_acorn
-index_sieve
+index_acorn.py
+index_sieve.py
