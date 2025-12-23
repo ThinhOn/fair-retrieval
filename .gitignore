@@ -1,0 +1,15 @@
+data/*
+models/
+output*
+output*
+configs/
+code/le*
+code/__py*
+code/test*
+analysis*
+plots.py
+embed.py
+generate_queries_vary_m
+CLIP_ex*
+index_acorn
+index_sieve
