@@ -8,7 +8,7 @@ Download and unzip in the main project folder.
 The structure of data folders should be as follows:
 <project_folder>/data/<dataset>
 
-For example, if the project folder is `fair-retrieval`, we can access the folder of `audio` dataset in: `fair-retrieval/audio/*`
+For example, if the project folder is `fair-retrieval`, we can access the folder of `audio` dataset in: `fair-retrieval/data/audio/*`
 
 ## Query generation
 To generate custom queries, run bash script:
