@@ -162,8 +162,25 @@ class BruteForceCartesian:
             return None, None
 
         start = time.time()
-        solver = build_solver(self.args)
-        results = solver.solve(final_cands, query)
+        if self.args.m > 1:
+            solver = build_solver(self.args)
+            results = solver.solve(final_cands, query)
+        else:
+            count = {k: {v: 0 for v in reqs} for k, reqs in query['count'].items()}
+            for text, _ in final_cands:
+                parts = text.split("__")
+                for part in parts:
+                    if ":" not in part:
+                        continue
+                    key, val = part.split(":")
+                    if key in query['count'] and val in query['count'][key]:
+                        count[key][val] += 1
+            results = {
+                'objective': sum(cand[1] for cand in final_cands),
+                'selected': [cand[0] for cand in final_cands],
+                'count': count,
+            }
+
         postprocessing_time += time.time() - start
 
         results['search_time'] = search_time

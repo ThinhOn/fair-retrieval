@@ -20,19 +20,25 @@ HashKey = Tuple[int, ...]  # the concatenated (k-long) hash key
 # Base LSH families (single hash)
 # -----------------------------
 @dataclass
-class L2Hash:  # p-stable LSH for L2 (Datar et al., 2004)
-    a: np.ndarray      # shape (d,)
-    b: float           # offset in [0, w)
-    w: float           # bucket width
+class HyperplaneHash:
+    """
+    Random hyperplane LSH for angular / cosine similarity.
+
+    h(x) = 1 if a·x >= 0 else 0
+
+    NOTE: For proper angular LSH, x should be L2-normalized before hashing.
+    """
+    a: np.ndarray  # shape (d,)
 
     @staticmethod
-    def sample(d: int, w: float, rng: np.random.Generator) -> "L2Hash":
-        a = rng.normal(size=d)         # Gaussian ~ N(0, I)
-        b = rng.uniform(0.0, w)
-        return L2Hash(a=a, b=b, w=w)
+    def sample(d: int, rng: np.random.Generator) -> "HyperplaneHash":
+        # Gaussian normal; only the sign matters
+        a = rng.normal(size=d)
+        return HyperplaneHash(a=a)
 
     def __call__(self, x: np.ndarray) -> int:
-        return int(np.floor((self.a @ x + self.b) / self.w))
+        # Bit valued hash (0 or 1)
+        return int(self.a @ x >= 0.0)
 
 # ------------------------------------------------------
 # Compound hash g(x) = (h1(x), ..., hk(x)) for one table
@@ -42,23 +48,19 @@ class L2Hash:  # p-stable LSH for L2 (Datar et al., 2004)
 class CompoundHash:
     funcs: Tuple[Callable[[np.ndarray], int], ...]  # length k
     A: Optional[np.ndarray] = None   # (k, d) for L2
-    b: Optional[np.ndarray] = None   # (k,)
-    w: Optional[float] = None        # bucket width (same for all funcs in L2)
 
     def __post_init__(self):
-        # If funcs are L2Hash objects, pre-pack into matrices for fast batch hashing
-        if self.funcs and isinstance(self.funcs[0], L2Hash):
+        if not self.funcs:
+            return
+
+        first = self.funcs[0]
+        if isinstance(first, HyperplaneHash):
             As = []
-            bs = []
-            w = self.funcs[0].w
             for f in self.funcs:
-                assert isinstance(f, L2Hash), "Mixed hash types not supported in vectorized path"
+                assert isinstance(f, HyperplaneHash), "Mixed hash types not supported in hyperplane vectorized path"
                 As.append(f.a)
-                bs.append(f.b)
-                assert f.w == w, "All L2Hash in a compound family must share the same w"
             self.A = np.stack(As, axis=0)      # (k, d)
-            self.b = np.asarray(bs)            # (k,)
-            self.w = w
+            return
 
     def __call__(self, x: np.ndarray) -> HashKey:
         """
@@ -67,10 +69,10 @@ class CompoundHash:
         """
         if self.A is not None:
             # (k,d) @ (d,) -> (k,)
-            proj = (self.A @ x + self.b) / self.w
-            return tuple(np.floor(proj).astype(int).tolist())
-        else:
-            return tuple(f(x) for f in self.funcs)
+            proj = self.A @ x
+            bits = (proj >= 0).astype(np.int64)
+            return tuple(bits.tolist())
+        return tuple(f(x) for f in self.funcs)
 
     def batch(self, X: np.ndarray) -> np.ndarray:
         """
@@ -79,18 +81,9 @@ class CompoundHash:
         Returns: (n, k) int64 array of hash coordinates.
         """
         if self.A is not None:
-            # X: (n,d), A: (k,d) -> (n,k)
-            proj = (X @ self.A.T + self.b) / self.w
-            return np.floor(proj).astype(np.int64)
-        else:
-            # Generic (slower) fallback if funcs are not L2Hash
-            n = X.shape[0]
-            k = len(self.funcs)
-            out = np.empty((n, k), dtype=np.int64)
-            for j, f in enumerate(self.funcs):
-                # Apply scalar hash to each row
-                out[:, j] = np.apply_along_axis(f, 1, X)
-            return out
+            proj = X @ self.A.T  # (n,k)
+            bits = (proj >= 0).astype(np.int64)
+            return bits
             
 def make_compound_family(
     family_sampler: Callable[[], Callable[[np.ndarray], int]],
@@ -102,11 +95,7 @@ def make_compound_family(
 
 
 
-# -----------------------------------------
-# Multi-table LSH index (ℓ independent g_j)
-# -----------------------------------------
-
-class L2LSHCartesian:
+class AngularLSHCartesian:
     r"""
     Generic LSH index with $\ell$ tables; each table uses a compound hash of k base hashes.
     Buckets store integer ids; you can store payloads separately if desired.
@@ -147,9 +136,17 @@ class L2LSHCartesian:
         self.tables = {}
         self.hashes = {}
 
-        p1 = self.collision_probability(self.r, self.w)
-        p2 = self.collision_probability(self.c * self.r, self.w)
+        # Interpret args.r as angular threshold (radians).
+        # For "far" points, use angle c * r, clipped to π.
+        theta1 = self.r
+        theta2 = min(self.c * self.r, math.pi)
+
+        p1 = self.collision_probability(theta1, self.w)
+        p2 = self.collision_probability(theta2, self.w)
         for pi, oids in self.partitions.items():    # for each partition \pi
+            if not oids:
+                continue
+
             if args.mu == 0:
                 mu = math.ceil( math.log(len(oids)) / math.log(1/p2) )
                 mu = max(1, mu)
@@ -161,68 +158,23 @@ class L2LSHCartesian:
             self.hashes[pi] = []
 
             for _ in range(ell):
-                # if family == "l2":
                 def sampler() -> Callable[[np.ndarray], int]:
-                    h = L2Hash.sample(d=self.d, w=self.w, rng=self.rng)
+                    h = HyperplaneHash.sample(d=self.d, rng=self.rng)
                     return h
-                # else:
-                #     def sampler() -> Callable[[np.ndarray], int]:
-                #         h = HyperplaneHash.sample(d=self.d, rng=self.rng)
-                #         return h
                 self.hashes[pi].append(make_compound_family(sampler, mu=mu, rng=self.rng))
-            # print(mu, ell)
-            # print(self.hashes)
-            # exit()
 
     @staticmethod
-    def collision_probability(r, w):
+    def collision_probability(theta: float, w: Optional[float] = None) -> float:
         """
-        Compute collision probability for L2 LSH given distance r and bucket width w.
+        Collision probability for random hyperplane LSH between two vectors
+        at angle theta:
+            p(theta) = 1 - theta / pi
+        The `w` parameter is ignored but kept for API compatibility.
         """
-        # integrand: PDF of N(0, r^2) scaled + linear term (1 - t/w)
-        integrand = lambda t: (1 - t / w) * (1 / r) * norm.pdf(t / r)
-        result, _ = quad(integrand, 0, w)
-        return 2 * result  # account for both sides of distribution
+        theta = float(theta)
+        theta = max(0.0, min(theta, math.pi))
+        return 1.0 - theta / math.pi
 
-    def find_R_for_p1(self, target_p1, w, R_min=1e-9, R_max=1e4, tol=1e-6, max_iter=60):
-        """
-        Solve for R such that collision_probability(R, w) = target_p1.
-        
-        Parameters:
-            target_p1 : float   # desired collision probability for "near" points
-            w         : float   # bucket width for L2-LSH
-            R_min     : float   # lower search bound
-            R_max     : float   # upper search bound
-            tol       : float   # absolute tolerance on p1
-            max_iter  : int     # max binary search steps
-        
-        Returns:
-            float: value of R such that p1 ≈ target_p1
-        """
-        # Safety checks
-        if not (0 < target_p1 < 1):
-            raise ValueError("target_p1 must be between 0 and 1")
-
-        # Expand R_max until the collision probability drops below target_p1
-        while self.collision_probability(R_max, w) > target_p1:
-            R_max *= 2
-            if R_max > 1e12:
-                raise RuntimeError("R too large; check w or target_p1 settings.")
-
-        # Binary search
-        for _ in range(max_iter):
-            R_mid = 0.5 * (R_min + R_max)
-            p_mid = self.collision_probability(R_mid, w)
-
-            if abs(p_mid - target_p1) < tol:
-                return R_mid
-
-            if p_mid > target_p1:
-                R_min = R_mid  # need larger R to reduce collision probability
-            else:
-                R_max = R_mid
-
-        return 0.5 * (R_min + R_max)  # best estimate
 
     @staticmethod
     def parse_kv_string(s):
@@ -346,7 +298,6 @@ class L2LSHCartesian:
                 "requirement": requirement,
                 "partitions": matching_parts,
             }
-        # print(f"combo info: {combo_info}")
         
         total_scan = 0
         for combo, info in combo_info.items():
@@ -381,24 +332,8 @@ class L2LSHCartesian:
             return None
 
         start = time.time()
-        if self.args.m > 1:
-            solver = build_solver(self.args)
-            results = solver.solve(final_cands, query)
-        else:
-            count = {k: {v: 0 for v in reqs} for k, reqs in query['count'].items()}
-            for text, _ in final_cands:
-                parts = text.split("__")
-                for part in parts:
-                    if ":" not in part:
-                        continue
-                    key, val = part.split(":")
-                    if key in query['count'] and val in query['count'][key]:
-                        count[key][val] += 1
-            results = {
-                'objective': sum(cand[1] for cand in final_cands),
-                'selected': [cand[0] for cand in final_cands],
-                'count': count,
-            }
+        solver = build_solver(self.args)
+        results = solver.solve(final_cands, query)
 
         postprocessing_time += time.time() - start
 

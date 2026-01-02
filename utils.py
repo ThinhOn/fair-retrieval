@@ -1,6 +1,7 @@
 import random
 import numpy as np
 import os
+import math
 import tqdm
 import torch
 from PIL import Image
@@ -22,13 +23,13 @@ def set_seed(seed):
 
 
 def load_occupation_data(
-        labels_df,
-        data_dir,
-        model,
-        batch_size=256,
-        transform=None,
-        device='cuda',
-    ):
+    labels_df,
+    data_dir,
+    model,
+    batch_size=256,
+    transform=None,
+    device='cuda',
+):
 
     images, occups, genders, metadata = [], [], [], []
 
@@ -68,13 +69,13 @@ def load_img_and_metadata(idx, data_dir, labels_df):
 
 
 def load_fairface_data(
-        labels_df,
-        data_dir,
-        model,
-        batch_size=256,
-        transform=None,
-        device='cuda',
-        ):
+    labels_df,
+    data_dir,
+    model,
+    batch_size=256,
+    transform=None,
+    device='cuda',
+):
     n = len(labels_df)
     images, metadata = [], []
 
@@ -100,11 +101,11 @@ def load_fairface_data(
 
 
 def load_social_counterfactual_data(
-        model,
-        batch_size=256,
-        transform=None,
-        device='cuda',
-        ):
+    model,
+    batch_size=256,
+    transform=None,
+    device='cuda',
+):
 
     def compute_embedding(batch):
         # TODO: find unique ID of each image
@@ -167,8 +168,13 @@ def euclidean_dist_centered(x, y):
 def l1norm_dist(x, y):
     return sum(abs(x - y))
 
+# def cosine_dist(x, y):
+#     return 1 - float(np.dot(x, y)) / ((np.dot(x, x) * np.dot(y, y)) ** 0.5)
+
 def cosine_dist(x, y):
-    return 1 - float(np.dot(x, y)) / ((np.dot(x, x) * np.dot(y, y)) ** 0.5)
+    cos = float(x @ y)
+    cos = max(-1.0, min(1.0, cos))
+    return math.acos(cos) / math.pi
 
 def get_dist_func(dist_func_name):
     if dist_func_name == "euclidean":

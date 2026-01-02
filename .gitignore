@@ -11,5 +11,4 @@ plots.py
 embed.py
 generate_queries_vary_m
 CLIP_ex*
-index_acorn.py
-index_sieve.py
+__pycache__/

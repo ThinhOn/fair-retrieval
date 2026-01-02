@@ -2,8 +2,8 @@
 
 METHODS=(
     sieve_cartesian
-    filter_diskann
-    brute_force_cartesian
+    # filter_diskann
+    # brute_force_cartesian
 )
 
 DATASET=${1}
@@ -12,26 +12,26 @@ M_ATTR=${3}
 
 
 ## add LSH methods based on distance function
-if [[ "$FDIST" == "euclidean" ]]; then
-    METHODS+=(
-        l2lsh_cartesian
-        l2lsh_single
-        l2lsh_joint
-    )
-elif [[ "$FDIST" == "cosine" ]]; then
-    METHODS+=(
-        angular_lsh_cartesian
-        angular_lsh_single
-        angular_lsh_joint
-    )
-fi
+# if [[ "$FDIST" == "euclidean" ]]; then
+#     METHODS+=(
+#         l2lsh_cartesian
+#         l2lsh_single
+#         l2lsh_joint
+#     )
+# elif [[ "$FDIST" == "cosine" ]]; then
+#     METHODS+=(
+#         angular_lsh_cartesian
+#         angular_lsh_single
+#         angular_lsh_joint
+#     )
+# fi
 
 for method in "${METHODS[@]}"; do
     ## determine main file to be called
     if [[ "$method" == *lsh* ]]; then
         MAIN="main_lsh.sh"
     elif [[ "$method" == *sieve* ]]; then
-        MAIN="main_sieve.sh"
+        MAIN="main_sieve_copy.sh"
     elif [[ "$method" == *disk* ]]; then
         MAIN="main_diskann.sh"
     elif [[ "$method" == *brute* ]]; then

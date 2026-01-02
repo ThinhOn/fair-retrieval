@@ -339,6 +339,7 @@ class SIEVECartesian:
             # Gather candidates from each subindex
             cand_ids: List[int] = []
             cand_dists: List[float] = []
+            # print(matching_parts)
             for key in matching_parts:
                 idx = self._subidx[key]
                 ids, dists = idx.query(query_vec, k_sub)
@@ -354,7 +355,7 @@ class SIEVECartesian:
                     best[i] = dist
 
             if not best:
-                return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.float32)
+                return None
 
             all_ids = np.fromiter(best.keys(), dtype=np.int64, count=len(best))
             all_dists = np.fromiter(best.values(), dtype=float, count=len(best))

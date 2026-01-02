@@ -8,6 +8,9 @@ from .sieve_cartesian import SIEVECartesian
 from .sieve_single import SIEVESingle
 from .brute_force_cartesian import BruteForceCartesian
 from .filter_diskann import FilterDiskANN
+from .angular_lsh_cartesian import AngularLSHCartesian
+from .angular_lsh_joint import AngularLSHJoint
+from .angular_lsh_single import AngularLSHSingle
 
 indexes = {
     # "lsh_cartesian": LSHCartesian,
@@ -20,6 +23,9 @@ indexes = {
     "sieve_single": SIEVESingle,
     "brute_force_cartesian": BruteForceCartesian,
     "filter_diskann": FilterDiskANN,
+    "angular_lsh_cartesian": AngularLSHCartesian,
+    "angular_lsh_joint": AngularLSHJoint,
+    "angular_lsh_single": AngularLSHSingle,
 }
 
 

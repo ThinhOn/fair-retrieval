@@ -4,15 +4,21 @@ BASE_PATH="."
 export PYTHONPATH=${BASE_PATH}
 
 # index
-INDEX=${1-"l2lsh_cartesian"}
+INDEX=${1}
 # data
-DATASET=${2-"audio"}
+DATASET=${2}
 DATA_DIR="./data/${DATASET}"
 M=${3}
-FDIST=${4-"euclidean"}
+FDIST=${4}
 
 C=2.0
 DELTA=0.1
+
+if [[ "$M" == 2 ]]; then
+    SOLVER="network_flow"
+else 
+    SOLVER="ilp"
+fi
 
 
 ### vary W
@@ -35,7 +41,7 @@ for W in 4.0 6.0 8.0 10.0; do
     OPTS+=" --fdist ${FDIST}"
     OPTS+=" --delta ${DELTA}"
     #solver
-    OPTS+=" --solver ilp"
+    OPTS+=" --solver ${SOLVER}"
     # runtime
     OPTS+=" --seed 10"
 
@@ -64,7 +70,7 @@ for L in 8 16 32 64 128; do
     OPTS+=" --fdist ${FDIST}"
     OPTS+=" --delta ${DELTA}"
     #solver
-    OPTS+=" --solver ilp"
+    OPTS+=" --solver ${SOLVER}"
     # runtime
     OPTS+=" --seed 10"
 
@@ -93,7 +99,7 @@ for MU in 1 2 4 8; do
     OPTS+=" --fdist ${FDIST}"
     OPTS+=" --delta ${DELTA}"
     #solver
-    OPTS+=" --solver ilp"
+    OPTS+=" --solver ${SOLVER}"
     # runtime
     OPTS+=" --seed 10"
     CMD="python ${BASE_PATH}/code/main.py ${OPTS}"
@@ -119,7 +125,7 @@ done
 # OPTS+=" --fdist ${FDIST}"
 # OPTS+=" --delta ${DELTA}"
 # #solver
-# OPTS+=" --solver ilp"
+# OPTS+=" --solver ${SOLVER}"
 # # runtime
 # OPTS+=" --seed 10"
 # CMD="python ${BASE_PATH}/code/main.py ${OPTS}"

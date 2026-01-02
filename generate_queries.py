@@ -241,11 +241,6 @@ if __name__ == "__main__":
         vector_store = vector_store[:1000000]
         metadata_store = metadata_store[:1000000]
 
-    if args.fdist == "cosine":
-        norms = np.linalg.norm(vector_store, axis=1, keepdims=True)
-        norms = np.maximum(norms, 1e-12)
-        vector_store = vector_store / norms
-
     df_meta = summarize_metadata(metadata_store)
 
     attributes_dict = {
