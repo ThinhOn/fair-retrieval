@@ -2,19 +2,19 @@ import time
 import pulp as pl
 from typing import List, Tuple, Dict, Optional, Any
 
-
 class ILPSolver:
     def __init__(
         self,
         msg: bool = False,
         time_limit: Optional[int] = None,
-        allow_soft_counts: bool = False,
-        soft_penalty_weight: float = 100.0,
+        allow_soft_counts: bool = False,      # NEW
+        soft_penalty_weight: float = 100.0,  # NEW: per unit of violation
     ):
         self.msg = msg
         self.time_limit = time_limit
         self.allow_soft_counts = allow_soft_counts
         self.soft_penalty_weight = soft_penalty_weight
+
 
     def solve(
         self,
@@ -23,6 +23,7 @@ class ILPSolver:
         value_alias=None,
     ):
         n = len(candidates)
+
         query_counts = query['count']
         topk = query['k']
 
@@ -38,28 +39,28 @@ class ILPSolver:
         model = pl.LpProblem("select_k", pl.LpMinimize)
         x = pl.LpVariable.dicts("x", list(range(n)), lowBound=0, upBound=1, cat="Binary")
 
+        # Base objective (distance)
         base_obj = pl.lpSum(candidates[i][1] * x[i] for i in range(n))
 
-        # Cardinality constraint (always hard)
+        # Cardinality (keep this hard)
         model += pl.lpSum(x[i] for i in range(n)) == topk, "choose_topk"
 
-        # Detect whether constraints are ranged (lb, ub) or exact integers
-        is_ranged = self._is_ranged(query_counts)
-
-        if is_ranged:
-            self._add_ranged_constraints(model, x, attr_val_to_idxs, query_counts, topk)
-        elif self.allow_soft_counts:
-            self._add_soft_exact_constraints(model, x, attr_val_to_idxs, query_counts)
+        # Exact-count / soft-count constraints
+        if self.allow_soft_counts:
+            # soft constraints: we get a penalty expression
+            penalty_expr = self._add_soft_exact_constraints(
+                model, x, attr_val_to_idxs, query_counts
+            )
+            ### objective = distance + penalty_weight * total_violation
+            # model += base_obj + self.soft_penalty_weight * penalty_expr, "min_total_distance_plus_penalty"
         else:
+            # original hard constraints
             self._add_exact_constraints(model, x, attr_val_to_idxs, query_counts, topk)
 
         model += base_obj, "min_total_distance"
 
-        solver = (
-            pl.PULP_CBC_CMD(msg=self.msg, timeLimit=self.time_limit)
-            if self.time_limit
-            else pl.PULP_CBC_CMD(msg=self.msg)
-        )
+        # Solve
+        solver = pl.PULP_CBC_CMD(msg=self.msg, timeLimit=self.time_limit) if self.time_limit else pl.PULP_CBC_CMD(msg=self.msg)
         status_code = model.solve(solver)
         status = pl.LpStatus.get(status_code, str(status_code))
 
@@ -70,6 +71,7 @@ class ILPSolver:
             objective = float('inf')
         selected = [candidates[i] for i in indices]
 
+        # Summarize counts for any constrained attributes
         constrained_attrs = set(query_counts.keys())
         counts = {a: self._count_attr(a, indices, metas) for a in constrained_attrs}
 
@@ -81,89 +83,7 @@ class ILPSolver:
             "selected": selected,
         }
 
-    # ---------- constraint builders ----------
-
-    def _add_ranged_constraints(
-        self,
-        model: pl.LpProblem,
-        x: Dict[int, pl.LpVariable],
-        idxs: Dict[str, Dict[str, List[int]]],
-        ranged_counts: Dict[str, Dict[str, Tuple[int, int]]],
-        topk: int,
-    ) -> None:
-        """
-        For each (attr, val, (lb, ub)):
-            lb ≤ Σ_{i in rows(attr,val)} x_i ≤ ub
-
-        Bounds of 0 or topk are redundant (x_i ∈ {0,1} already enforces them)
-        and are skipped to keep the model lean.
-        """
-        for attr, vm in ranged_counts.items():
-            for val, (lb, ub) in vm.items():
-                rows = idxs.get(attr, {}).get(val, [])
-                expr = pl.lpSum(x[i] for i in rows)
-
-                if lb > 0:
-                    cname_lb = self._safe_name("lb", attr, val)
-                    model += expr >= int(lb), cname_lb
-
-                if ub < topk:
-                    cname_ub = self._safe_name("ub", attr, val)
-                    model += expr <= int(ub), cname_ub
-
-    def _add_exact_constraints(
-        self,
-        model: pl.LpProblem,
-        x: Dict[int, pl.LpVariable],
-        idxs: Dict[str, Dict[str, List[int]]],
-        exact_counts: Dict[str, Dict[str, int]],
-        topk: int,
-    ) -> None:
-        for attr, vm in exact_counts.items():
-            specified_total = sum(vm.values())
-            for val, need in vm.items():
-                rows = idxs.get(attr, {}).get(val, [])
-                cname = self._safe_name("eq", attr, val)
-                model += pl.lpSum(x[i] for i in rows) == int(need), cname
-            if specified_total == topk:
-                covered = set()
-                for val in vm.keys():
-                    covered.update(idxs.get(attr, {}).get(val, []))
-                other = set(range(len(x))) - covered
-                if other:
-                    cname = self._safe_name("forbid_other", attr)
-                    model += pl.lpSum(x[i] for i in other) == 0, cname
-
-    def _add_soft_exact_constraints(
-        self,
-        model: pl.LpProblem,
-        x: Dict[int, pl.LpVariable],
-        idxs: Dict[str, Dict[str, List[int]]],
-        exact_counts: Dict[str, Dict[str, int]],
-    ) -> pl.LpAffineExpression:
-        penalty_terms = []
-        for attr, vm in exact_counts.items():
-            for val, need in vm.items():
-                rows = idxs.get(attr, {}).get(val, [])
-                cname = self._safe_name("soft_eq", attr, val)
-                over  = pl.LpVariable(self._safe_name("over",  attr, val), lowBound=0, cat="Continuous")
-                under = pl.LpVariable(self._safe_name("under", attr, val), lowBound=0, cat="Continuous")
-                model += (
-                    pl.lpSum(x[i] for i in rows) - over + under == int(need)
-                ), cname
-                penalty_terms.append(over + under)
-        return pl.lpSum(penalty_terms) if penalty_terms else pl.lpSum([])
-
     # ---------- helpers ----------
-
-    @staticmethod
-    def _is_ranged(query_counts: dict) -> bool:
-        """Return True if constraint values are (lb, ub) tuples, False if exact ints."""
-        for vm in query_counts.values():
-            for v in vm.values():
-                return isinstance(v, (tuple, list))
-        return False
-
     @staticmethod
     def _parse_meta(s: str) -> Dict[str, str]:
         out: Dict[str, str] = {}
@@ -189,6 +109,71 @@ class ILPSolver:
         def norm(t: str) -> str:
             return t.replace(" ", "_").replace(":", "_").replace("-", "_").replace("/", "_")
         return "_".join(norm(p) for p in parts)
+
+    def _add_exact_constraints(
+        self,
+        model: pl.LpProblem,
+        x: Dict[int, pl.LpVariable],
+        idxs: Dict[str, Dict[str, List[int]]],
+        exact_counts: Dict[str, Dict[str, int]],
+        topk: int,
+    ) -> None:
+        for attr, vm in exact_counts.items():
+            specified_total = sum(vm.values())
+            # exact count per listed value
+            for val, need in vm.items():
+                rows = idxs.get(attr, {}).get(val, [])
+                cname = self._safe_name("eq", attr, val)
+                model += pl.lpSum(x[i] for i in rows) == int(need), cname
+            # if specified values already sum to K, forbid any other value for that attr
+            if specified_total == topk:
+                covered = set()
+                for val in vm.keys():
+                    covered.update(idxs.get(attr, {}).get(val, []))
+                other = set(range(len(x))) - covered
+                if other:
+                    cname = self._safe_name("forbid_other", attr)
+                    model += pl.lpSum(x[i] for i in other) == 0, cname
+
+    def _add_soft_exact_constraints(
+        self,
+        model: pl.LpProblem,
+        x: Dict[int, pl.LpVariable],
+        idxs: Dict[str, Dict[str, List[int]]],
+        exact_counts: Dict[str, Dict[str, int]],
+    ) -> pl.LpAffineExpression:
+        """
+        For each (attr, val, need):
+
+            sum_{i in rows(attr,val)} x_i - over + under = need
+            over, under >= 0
+
+        and we penalize (over + under) in the objective.
+        Returns: an expression equal to total violation sum(over+under).
+        """
+        penalty_terms = []
+
+        for attr, vm in exact_counts.items():
+            for val, need in vm.items():
+                rows = idxs.get(attr, {}).get(val, [])
+                cname = self._safe_name("soft_eq", attr, val)
+
+                # slack variables for violation
+                over = pl.LpVariable(self._safe_name("over", attr, val), lowBound=0, cat="Continuous")
+                under = pl.LpVariable(self._safe_name("under", attr, val), lowBound=0, cat="Continuous")
+
+                # sum(x_i) - over + under = need
+                model += (
+                    pl.lpSum(x[i] for i in rows) - over + under == int(need)
+                ), cname
+
+                penalty_terms.append(over + under)
+
+        if penalty_terms:
+            return pl.lpSum(penalty_terms)
+        else:
+            return pl.lpSum([])  # zero
+
 
     @staticmethod
     def _count_attr(attr: str, indices: List[int], metas: List[Dict[str, str]]) -> Dict[str, int]:

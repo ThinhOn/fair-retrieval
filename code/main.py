@@ -31,7 +31,7 @@ if __name__ == "__main__":
     vector_store, metadata_store = npz_data['vectors'], npz_data['metadata']
 
     if "celeb" in DATASET:
-        metadata_store = np.load(f"{args.data_dir}/metadata_m=5.npz")['metadata']
+        metadata_store = np.load(f"{args.data_dir}/metadata_m={args.m}.npz")['metadata']
 
     if "paper" in DATASET:
         vector_store = vector_store[:1000000]
@@ -97,11 +97,35 @@ if __name__ == "__main__":
     """
     dfunc = get_dist_func(args.fdist)
 
-    for k in [5, 10, 15, 20]:
+    # for k in [5, 10, 15, 20]:
+    #     ## load query file
+    #     # query_suffix = f"k={k}_m={args.m}^5_fdist={args.fdist}_200"
+    #     query_suffix = f"k={k}_m={args.m}_fdist={args.fdist}_200"
+    #     query_path = f"{args.data_dir}/queries_{query_suffix}.pkl"
+    #     with open(query_path, 'rb') as f:
+    #         queries = pickle.load(f)
+
+    #     result_path = f"./outputs/{DATASET}/results_{query_suffix}/{INDEX}.pkl"
+    #     if not os.path.exists(os.path.dirname(result_path)):
+    #         os.makedirs(os.path.dirname(result_path))
+
+    #     results = {}
+    #     results["preprocessing_time"] = indexing_time
+    #     results["index_memory_MB"] = size_mb
+
+    #     results["query_results"] = []
+    #     for query in tqdm.tqdm(queries):
+    #         result = db.search_and_solve(query, vector_store, dfunc)
+    #         results["query_results"].append(result)
+        
+    #     with open(result_path, 'wb') as f:
+    #         pickle.dump(results, f)
+
+    for k in [5, 10, 15, 20, 25]:
         ## load query file
         # query_suffix = f"k={k}_m={args.m}^5_fdist={args.fdist}_200"
         query_suffix = f"k={k}_m={args.m}_fdist={args.fdist}_200"
-        query_path = f"{args.data_dir}/queries_{query_suffix}.pkl"
+        query_path = f"{args.data_dir}/ranged_queries_{query_suffix}.pkl"
         with open(query_path, 'rb') as f:
             queries = pickle.load(f)
 
@@ -118,5 +142,5 @@ if __name__ == "__main__":
             result = db.search_and_solve(query, vector_store, dfunc)
             results["query_results"].append(result)
         
-        with open(result_path, 'wb') as f:
-            pickle.dump(results, f)
+        # with open(result_path, 'wb') as f:
+        #     pickle.dump(results, f)
