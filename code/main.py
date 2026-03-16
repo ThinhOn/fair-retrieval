@@ -129,7 +129,7 @@ if __name__ == "__main__":
         with open(query_path, 'rb') as f:
             queries = pickle.load(f)
 
-        result_path = f"./outputs/{DATASET}/results_{query_suffix}/{INDEX}.pkl"
+        result_path = f"./outputs/{DATASET}/results_ranged_{query_suffix}/{INDEX}.pkl"
         if not os.path.exists(os.path.dirname(result_path)):
             os.makedirs(os.path.dirname(result_path))
 
@@ -142,5 +142,5 @@ if __name__ == "__main__":
             result = db.search_and_solve(query, vector_store, dfunc)
             results["query_results"].append(result)
         
-        # with open(result_path, 'wb') as f:
-        #     pickle.dump(results, f)
+        with open(result_path, 'wb') as f:
+            pickle.dump(results, f)

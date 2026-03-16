@@ -15,7 +15,8 @@ C=2.0
 DELTA=0.1
 
 if [[ "$M" == 2 ]]; then
-    SOLVER="network_flow"
+    # SOLVER="network_flow"
+    SOLVER="network_flow_ranged"
 else 
     SOLVER="ilp"
 fi

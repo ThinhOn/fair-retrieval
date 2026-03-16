@@ -2,6 +2,7 @@ from .ilp_solver import ILPSolver
 from .bfs_solver import BFSSolver
 from .lagrange_solver import LagrangeSolver
 from .network_flow_solver import NetworkFlowSolver
+from .network_flow_solver_ranged import NetworkFlowSolverRanged
 
 
 solvers = {
@@ -9,6 +10,7 @@ solvers = {
     "bfs": BFSSolver,
     "lagrange": LagrangeSolver,
     "network_flow": NetworkFlowSolver,
+    "network_flow_ranged": NetworkFlowSolverRanged,
 }
 
 

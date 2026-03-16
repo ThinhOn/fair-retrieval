@@ -284,7 +284,11 @@ class AngularLSHCartesian:
             counts = []
             for token in combo:
                 attr, val = token.split(":", 1)
-                counts.append(data[attr][val])
+                constraint = data[attr][val]
+                # ranged constraint: (lb, ub) — use ub as the per-partition ceiling
+                # exact constraint: integer — use as-is
+                ub = constraint[1] if isinstance(constraint, (tuple, list)) else constraint
+                counts.append(ub)
             requirement = min(counts)
 
             # --- matching partitions containing all tokens in combo ---

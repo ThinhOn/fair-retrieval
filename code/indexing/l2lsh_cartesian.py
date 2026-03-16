@@ -332,7 +332,11 @@ class L2LSHCartesian:
             counts = []
             for token in combo:
                 attr, val = token.split(":", 1)
-                counts.append(data[attr][val])
+                constraint = data[attr][val]
+                # ranged constraint: (lb, ub) — use ub as the per-partition ceiling
+                # exact constraint: integer — use as-is (equivalent to ub == lb)
+                ub = constraint[1] if isinstance(constraint, (tuple, list)) else constraint
+                counts.append(ub)
             requirement = min(counts)
 
             # --- matching partitions containing all tokens in combo ---
@@ -383,6 +387,10 @@ class L2LSHCartesian:
         start = time.time()
         if self.args.m > 1:
             solver = build_solver(self.args)
+            # for i, (meta, dist) in enumerate(final_cands[:3]):
+            #     print(f"cand[{i}]: type(dist)={type(dist)}, dist={dist}")
+            # print(f"query count sample: {list(query['count'].items())[:1]}")
+            # exit()
             results = solver.solve(final_cands, query)
         else:
             count = {k: {v: 0 for v in reqs} for k, reqs in query['count'].items()}

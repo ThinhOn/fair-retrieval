@@ -227,7 +227,10 @@ class AngularLSHSingle:
         for part in queried_parts:
             cands = []
             attr, val = part.split(":", 1)
-            k_pi = beta_hat[attr][val]
+            constraint = beta_hat[attr][val]
+            # ranged constraint: (lb, ub) — use ub as the per-partition ceiling
+            # exact constraint: integer — use as-is
+            k_pi = constraint[1] if isinstance(constraint, (tuple, list)) else constraint
             ell = len(self.tables[part])
             k_star = k_pi + math.ceil(2*ell/self.delta)
 
