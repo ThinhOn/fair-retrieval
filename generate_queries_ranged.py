@@ -294,7 +294,7 @@ if __name__ == "__main__":
     vector_store, metadata_store = npz_data['vectors'], npz_data['metadata']
 
     if "celeb" in DATASET:
-        print("load synthetic attributes with m=5")
+        print(f"load synthetic attributes with m={args.m}")
         metadata_store = np.load(f"{PATH}/metadata_m={args.m}.npz")['metadata']
 
     if "paper" in DATASET:
