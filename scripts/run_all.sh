@@ -1,15 +1,14 @@
 #! /bin/bash
 
-METHODS=(
-    sieve_cartesian
-    filter_diskann
-    brute_force_cartesian
-)
-
 DATASET=${1}
 FDIST=${2-"euclidean"}
 M_ATTR=${3}
 
+METHODS=(
+    # sieve_cartesian
+    # filter_diskann
+    # brute_force_cartesian
+)
 
 ## add LSH methods based on distance function
 if [[ "$FDIST" == "euclidean" ]]; then

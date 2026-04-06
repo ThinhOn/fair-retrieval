@@ -13,8 +13,6 @@ from scipy.stats import norm
 from scipy.integrate import quad
 from solver import build_solver
 
-import faiss
-
 HashKey = Tuple[int, ...]  # the concatenated (k-long) hash key
 
 

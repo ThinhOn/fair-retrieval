@@ -20,6 +20,14 @@ from numpy.random import default_rng
 from utils import get_dist_func, set_seed, summarize_metadata
 from solver import build_solver
 
+# ── billion-scale schema (must match generate_billion.py) ──────────────────
+ATTR_NAMES  = ["A1", "A2", "A3"]
+ATTR_VALUES = [
+    ["V11", "V12", "V13"],
+    ["V21", "V22", "V23", "V24"],
+    ["V31", "V32", "V33"],
+]
+
 seed = 10
 set_seed(seed)
 rng = default_rng(seed)
@@ -101,41 +109,43 @@ def generate_complex_queries(
 
 
 def precheck_query(query: dict, df_meta: pd.DataFrame,
-                   metadata_store: np.ndarray) -> tuple[bool, str]:
+                   metadata_store: np.ndarray,
+                   attrs_memmap=None,
+                   attr_counts: dict = None,
+                   partition_counts: dict = None) -> tuple[bool, str]:
     """
     Fast structural feasibility check for ranged queries.
 
-    query['count'] has the form:
-        { attr: { val: (lb, ub) } }
+    Two paths:
+    - Standard: uses df_meta (DataFrame) and metadata_store (string array).
+    - Billion-scale: uses attr_counts {attr: {val: int}} and
+      partition_counts {(code_tuple): int}, both pre-computed from attrs_memmap.
+      metadata_store is ignored in this path.
 
     Three conditions must hold:
-
-    1. Marginal availability
-       For every (attr, val) with lb > 0, the dataset must contain at least
-       lb items with attr=val.
-
-    2. Range-sum bounds
-       For each attribute: Σ lb_v ≤ k ≤ Σ ub_v.
-
-    3. Intersectional availability
-       For every Cartesian tuple of (attr:val) tokens whose lb > 0, at least
-       one dataset item must satisfy ALL tokens simultaneously.
+    1. Marginal availability: dataset has at least lb items for each mandatory (attr, val).
+    2. Range-sum bounds: Σ lb_v ≤ k ≤ Σ ub_v per attribute.
+    3. Intersectional availability: at least one item satisfies all mandatory tokens.
     """
     k = query['k']
     counts = query['count']     # { attr: { val: (lb, ub) } }
 
     # ── Check 1: marginal availability ───────────────────────────────────────
     for attr, val_ranges in counts.items():
-        if attr not in df_meta.columns:
-            return False, f"attribute '{attr}' not in dataset"
-        freq = df_meta[attr].value_counts()
         for val, (lb, ub) in val_ranges.items():
             if lb <= 0:
                 continue
-            # metadata values are stored as "attr:val" e.g. "A1:V12"
-            raw_val = val.split(':')[-1]
-            prefixed_val = f"{attr}:{raw_val}"
-            available = int(freq.get(prefixed_val, freq.get(raw_val, freq.get(val, 0))))
+            if attr_counts is not None:
+                # billion-scale: use pre-computed integer counts
+                available = attr_counts.get(attr, {}).get(val, 0)
+            else:
+                # standard: use DataFrame frequency table
+                if attr not in df_meta.columns:
+                    return False, f"attribute '{attr}' not in dataset"
+                freq = df_meta[attr].value_counts()
+                raw_val = val.split(':')[-1]
+                prefixed_val = f"{attr}:{raw_val}"
+                available = int(freq.get(prefixed_val, freq.get(raw_val, freq.get(val, 0))))
             if available < lb:
                 return False, (
                     f"not enough items: need at least {lb} × {attr}={val}, "
@@ -153,19 +163,32 @@ def precheck_query(query: dict, df_meta: pd.DataFrame,
             )
 
     # ── Check 3: intersectional availability (mandatory groups only) ──────────
-    # Only consider values with lb > 0; optional values (lb=0) need not appear.
     mandatory_token_lists = [
         [f"{attr}:{val}" for val, (lb, ub) in val_ranges.items() if lb > 0]
         for attr, val_ranges in counts.items()
     ]
-    # Skip attributes with no mandatory values
     mandatory_token_lists = [lst for lst in mandatory_token_lists if lst]
 
     for tpl in itt.product(*mandatory_token_lists):
-        found = any(
-            all(tok in meta for tok in tpl)
-            for meta in metadata_store
-        )
+        if partition_counts is not None:
+            # billion-scale: look up the intersection count via integer code tuple
+            code_key = []
+            valid = True
+            for token in sorted(tpl):   # sorted to match partition_counts key order
+                attr, val = token.split(":", 1)
+                j = ATTR_NAMES.index(attr)
+                try:
+                    code_key.append(ATTR_VALUES[j].index(val))
+                except ValueError:
+                    valid = False
+                    break
+            found = valid and partition_counts.get(tuple(code_key), 0) > 0
+        else:
+            # standard: scan metadata strings
+            found = any(
+                all(tok in meta for tok in tpl)
+                for meta in metadata_store
+            )
         if not found:
             return False, (
                 f"no dataset item satisfies mandatory intersection {tpl}"
@@ -199,12 +222,52 @@ def satisfies(combination, query_counts):
     return True
 
 
-def ground_truth_ilp(query, vector_store, metadata_store, dfunc, args):
+def _reconstruct_meta(oid: int, attrs_memmap) -> str:
+    """Reconstruct metadata string from integer attribute codes (billion-scale)."""
+    parts = [f"id:{oid}"]
+    for j, code in enumerate(attrs_memmap[oid]):
+        parts.append(f"{ATTR_NAMES[j]}:{ATTR_VALUES[j][int(code)]}")
+    return "__".join(parts)
+
+
+def _matching_ids_billion(tpl: tuple, attrs_memmap, chunk_size: int = 1_000_000):
+    """
+    Return ids whose integer attribute codes match all tokens in tpl.
+    tpl: e.g. ('A1:V12', 'A2:V23')
+    Uses integer comparison — O(n) but no string allocation.
+    """
+    # parse tokens into (attr_index, value_index) pairs
+    filters = []
+    for token in tpl:
+        attr, val = token.split(":", 1)
+        j = ATTR_NAMES.index(attr)
+        v = ATTR_VALUES[j].index(val)
+        filters.append((j, v))
+
+    n = attrs_memmap.shape[0]
+    matched = []
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        batch = attrs_memmap[start:end]          # (chunk, m) uint8
+        mask = np.ones(end - start, dtype=bool)
+        for j, v in filters:
+            mask &= (batch[:, j] == v)
+        local_ids = np.where(mask)[0]
+        matched.append(local_ids + start)
+    return np.concatenate(matched) if matched else np.array([], dtype=np.int64)
+
+
+def ground_truth_ilp(query, vector_store, metadata_store, dfunc, args,
+                     attrs_memmap=None):
     """
     Compute the ground-truth fair k-NN for a ranged query using the ILP solver.
 
-    query['count'] has the form { attr: { val: (lb, ub) } }.
+    Two paths:
+    - Standard (attrs_memmap=None): scans metadata_store strings.
+    - Billion-scale (attrs_memmap set): integer comparison over attrs_memmap,
+      no string allocation during candidate search.
 
+    query['count'] has the form { attr: { val: (lb, ub) } }.
     Returns (chosen, total_cost) or (None, None) if infeasible.
     """
     k = int(query['k'])
@@ -215,29 +278,35 @@ def ground_truth_ilp(query, vector_store, metadata_store, dfunc, args):
         attr_values.append([f"{attr}:{val}" for val in val_ranges.keys()])
     carte_tuples = list(itt.product(*attr_values))
 
-    # ── 2) Build id → metadata map ───────────────────────────────────────────
-    id2meta = {int(m.split('__')[0].split(':')[1]): m for m in metadata_store}
-
-    # ── 3) For each Cartesian tuple, collect matching ids and keep top-2k ────
+    # ── 2) For each tuple, collect matching ids and keep top-2k by distance ──
     per_tuple_topk = []
     for tpl in carte_tuples:
-        matches = [
-            m for m in metadata_store
-            if all(tok in m for tok in tpl)
-        ]
-        if not matches:
-            per_tuple_topk.append([])
-            continue
+        if attrs_memmap is not None:
+            # ── billion-scale: integer comparison ────────────────────────────
+            match_ids = _matching_ids_billion(tpl, attrs_memmap)
+            if len(match_ids) == 0:
+                per_tuple_topk.append([])
+                continue
+            dists = [
+                (int(oid), float(dfunc(query['vector'], vector_store[int(oid)])))
+                for oid in match_ids
+            ]
+        else:
+            # ── standard: string matching ─────────────────────────────────
+            matches = [m for m in metadata_store if all(tok in m for tok in tpl)]
+            if not matches:
+                per_tuple_topk.append([])
+                continue
+            dists = [
+                (int(m.split('__')[0].split(':')[1]),
+                 float(dfunc(query['vector'], vector_store[int(m.split('__')[0].split(':')[1])])))
+                for m in matches
+            ]
 
-        dists = [
-            (int(m.split('__')[0].split(':')[1]),
-             float(dfunc(query['vector'], vector_store[int(m.split('__')[0].split(':')[1])])))
-            for m in matches
-        ]
         dists = heapq.nsmallest(k * 2, dists, key=lambda x: x[1])
         per_tuple_topk.append(dists)
 
-    # ── 4) Union: keep best (min) cost per id ────────────────────────────────
+    # ── 3) Union: keep best (min) cost per id ────────────────────────────────
     id2best = {}
     for lst in per_tuple_topk:
         for oid, cost in lst:
@@ -247,11 +316,19 @@ def ground_truth_ilp(query, vector_store, metadata_store, dfunc, args):
     if not id2best:
         return None, None
 
-    candidates = [
-        (id2meta[oid], cost)
-        for oid, cost in id2best.items()
-        if oid in id2meta
-    ]
+    # ── 4) Build candidates with metadata strings ─────────────────────────────
+    if attrs_memmap is not None:
+        candidates = [
+            (_reconstruct_meta(oid, attrs_memmap), cost)
+            for oid, cost in id2best.items()
+        ]
+    else:
+        id2meta = {int(m.split('__')[0].split(':')[1]): m for m in metadata_store}
+        candidates = [
+            (id2meta[oid], cost)
+            for oid, cost in id2best.items()
+            if oid in id2meta
+        ]
 
     # ── 5) Call ILP solver ────────────────────────────────────────────────────
     solver = build_solver(args)
@@ -260,7 +337,6 @@ def ground_truth_ilp(query, vector_store, metadata_store, dfunc, args):
     if not result or not result.get('selected'):
         return None, None
 
-    # result['selected'] is a list of (meta_str, distance) tuples
     chosen = result['selected']
     chosen_ids = [int(m[0].split('__')[0].split(':')[1]) for m in chosen]
     total = sum(id2best[i] for i in chosen_ids if i in id2best)
@@ -290,25 +366,74 @@ if __name__ == "__main__":
     DATASET = args.dataset
     PATH = f"./data/{DATASET}"
 
-    npz_data = np.load(f'{PATH}/vectors.npz')
-    vector_store, metadata_store = npz_data['vectors'], npz_data['metadata']
+    # ── detect billion-scale dataset ──────────────────────────────────────────
+    import os
+    vec_dat  = os.path.join(PATH, "vectors.dat")
+    attr_dat = os.path.join(PATH, "attributes.dat")
+    is_billion = os.path.exists(vec_dat) and os.path.exists(attr_dat)
 
-    if "celeb" in DATASET:
-        print(f"load synthetic attributes with m={args.m}")
-        metadata_store = np.load(f"{PATH}/metadata_m={args.m}.npz")['metadata']
+    if is_billion:
+        print("Detected billion-scale dataset (vectors.dat + attributes.dat)")
+        meta_info    = np.load(os.path.join(PATH, "metadata.npz"), allow_pickle=True)
+        n_total      = int(meta_info["n"][0])
+        d_total      = int(meta_info["d"][0])
+        m_attrs      = int(meta_info["attr_sizes"].shape[0])
+        vector_store = np.memmap(vec_dat,  dtype=np.float32, mode="r",
+                                 shape=(n_total, d_total))
+        attrs_memmap = np.memmap(attr_dat, dtype=np.uint8,   mode="r",
+                                 shape=(n_total, m_attrs))
+        metadata_store = None
+        df_meta        = None
 
-    if "paper" in DATASET:
-        vector_store = vector_store[:1000000]
-        metadata_store = metadata_store[:1000000]
+        # attribute dict: {attr_name: [val_str, ...]}
+        attributes_dict = {
+            ATTR_NAMES[j]: ATTR_VALUES[j]
+            for j in range(m_attrs)
+        }
 
-    df_meta = summarize_metadata(metadata_store)
+        # pre-compute marginal counts from attrs_memmap (O(n), one pass)
+        print("Computing attribute value counts from attrs_memmap ...")
+        attr_counts = {name: {val: 0 for val in vals}
+                       for name, vals in attributes_dict.items()}
+        partition_counts = {}   # {(code_tuple): count}
+        chunk = 1_000_000
+        for start in range(0, n_total, chunk):
+            end = min(start + chunk, n_total)
+            batch = attrs_memmap[start:end]
+            for local_i in range(end - start):
+                codes = tuple(int(c) for c in batch[local_i])
+                # marginal counts
+                for j, name in enumerate(ATTR_NAMES[:m_attrs]):
+                    attr_counts[name][ATTR_VALUES[j][codes[j]]] += 1
+                # partition counts
+                partition_counts[codes] = partition_counts.get(codes, 0) + 1
+        print("Done computing counts.")
 
-    attributes_dict = {
-        k: df_meta[k].apply(lambda x: x.split(':')[1]).unique().tolist()
-        for k in df_meta.columns
-    }
+    else:
+        # ── standard path ─────────────────────────────────────────────────────
+        attrs_memmap     = None
+        attr_counts      = None
+        partition_counts = None
 
-    BATCH = 80
+        npz_data = np.load(f'{PATH}/vectors.npz')
+        vector_store, metadata_store = npz_data['vectors'], npz_data['metadata']
+
+        if "celeb" in DATASET:
+            print(f"load synthetic attributes with m={args.m}")
+            metadata_store = np.load(f"{PATH}/metadata_m={args.m}.npz")['metadata']
+
+        if "paper" in DATASET:
+            vector_store = vector_store[:1000000]
+            metadata_store = metadata_store[:1000000]
+
+        df_meta = summarize_metadata(metadata_store)
+
+        attributes_dict = {
+            k: df_meta[k].apply(lambda x: x.split(':')[1]).unique().tolist()
+            for k in df_meta.columns
+        }
+
+    BATCH = 800
     queries = []
     seen = set()
 
@@ -344,7 +469,12 @@ if __name__ == "__main__":
     prechecked = []
     n_rejected = 0
     for q in queries:
-        ok, reason = precheck_query(q, df_meta, metadata_store)
+        ok, reason = precheck_query(
+            q, df_meta, metadata_store,
+            attrs_memmap=attrs_memmap,
+            attr_counts=attr_counts,
+            partition_counts=partition_counts,
+        )
         if ok:
             prechecked.append(q)
         else:
@@ -357,7 +487,8 @@ if __name__ == "__main__":
     valid_query_idx = []
     for idx, query in enumerate(tqdm.tqdm(queries, desc="Computing ground truth", unit="query")):
         result = ground_truth_ilp(
-            query, vector_store, metadata_store, dfunc=dfunc, args=args
+            query, vector_store, metadata_store, dfunc=dfunc, args=args,
+            attrs_memmap=attrs_memmap,
         )
         if result is None or result == (None, None):
             continue
