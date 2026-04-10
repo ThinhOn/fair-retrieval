@@ -197,28 +197,30 @@ class L2LSHSingle:
         partitions = self.protected_attrs
 
         if self.attrs_memmap is not None:
-            # build reverse lookup: (attr_index, value_index) -> partition string
+            # Vectorised: for single indexing each point belongs to one partition
+            # per attribute column. Use column-wise boolean mask — no Python loop.
             token_to_part = {}
             for p in partitions:
                 attr, val = p.split(":", 1)
                 if attr in ATTR_NAMES:
                     j = ATTR_NAMES.index(attr)
-                    v = ATTR_VALUES[j].index(val)
-                    token_to_part[(j, v)] = p
+                    if val in ATTR_VALUES[j]:
+                        v = ATTR_VALUES[j].index(val)
+                        token_to_part[(j, v)] = p
 
             out = {p: [] for p in partitions}
             n = self.attrs_memmap.shape[0]
-            chunk = 1_000_000
+            chunk = 10_000
             for start in range(0, n, chunk):
                 end = min(start + chunk, n)
                 batch = self.attrs_memmap[start:end]   # (chunk, m) uint8
-                for local_i in range(end - start):
-                    oid = start + local_i
-                    for j in range(batch.shape[1]):
-                        key = (j, int(batch[local_i, j]))
-                        p = token_to_part.get(key)
-                        if p is not None:
-                            out[p].append(oid)
+                ids = np.arange(start, end, dtype=np.int64)
+                for (j, v), p in token_to_part.items():
+                    mask = batch[:, j] == v          # vectorised column compare
+                    if mask.any():
+                        out[p].append(ids[mask])
+
+            out = {k: np.concatenate(v) for k, v in out.items() if v}
             return out
 
         else:
@@ -234,31 +236,36 @@ class L2LSHSingle:
             return out
 
 
-    def build_index(self, X: np.ndarray, chunk_size: int = 500_000):
+    def build_index(self, X: np.ndarray, chunk_size: int = 10_000):
         """
         Bulk indexing, one partition at a time in chunks.
-        For billion-scale datasets, processes each partition in chunks of
-        chunk_size rows so that only ~chunk_size * d * 4 bytes live in RAM.
+
+        Optimisations for billion-scale:
+        - ids_arr is sorted so memmap accesses are sequential (avoids random seeks).
+        - Hash keys inserted with plain per-row append (no np.unique sort overhead).
+        - chunk_size bounds RAM to chunk_size * d * 4 bytes per iteration.
         """
         assert X.shape[1] == self.d, "Dimension mismatch in build_index"
 
         for pi, ids in self.partitions.items():
-            if not ids:
+            if not len(ids):
                 continue
-            ids_arr = np.asarray(ids, dtype=np.int64)
+
+            # Sort ids for sequential memmap access
+            ids_arr = np.sort(np.asarray(ids, dtype=np.int64))
             n_pi = len(ids_arr)
 
             for T, g in zip(self.tables[pi], self.hashes[pi]):
                 for chunk_start in range(0, n_pi, chunk_size):
                     chunk_end = min(chunk_start + chunk_size, n_pi)
                     ids_chunk = ids_arr[chunk_start:chunk_end]
-                    X_chunk = X[ids_chunk]   # memmap random access
+                    X_chunk = X[ids_chunk]   # sequential read after sorting
 
                     key_mat = g.batch(X_chunk)   # (chunk, mu)
 
-                    for obj_id, key_row in zip(ids_chunk, key_mat):
-                        key = tuple(key_row.tolist())
-                        T[key].append(int(obj_id))
+                    for i in range(len(ids_chunk)):
+                        key = tuple(key_mat[i].tolist())
+                        T[key].append(int(ids_chunk[i]))
 
     # ---- query ----
     def search_and_solve(self, query, vector_store, dfunc):

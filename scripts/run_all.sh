@@ -14,8 +14,8 @@ METHODS=(
 if [[ "$FDIST" == "euclidean" ]]; then
     METHODS+=(
         l2lsh_cartesian
-        l2lsh_single
-        l2lsh_joint
+        # l2lsh_single
+        # l2lsh_joint
     )
 elif [[ "$FDIST" == "cosine" ]]; then
     METHODS+=(

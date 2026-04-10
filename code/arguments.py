@@ -51,6 +51,8 @@ def add_runtime_args(parser: argparse.ArgumentParser):
     group.add_argument('--solver', type=str, default="ilp")
     group.add_argument('--save-dir', type=str, default=None)
     group.add_argument('--seed', type=int, default=10)
+    group.add_argument("--chunk_size", type=int, default=10_000)
+    group.add_argument("--n_workers",  type=int, default=16)
     return parser
 
 

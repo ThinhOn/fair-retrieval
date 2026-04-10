@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import math
 import time
 import numpy as np
-from tqdm import tqdm
+import tqdm
 from dataclasses import dataclass
 from typing import Tuple, Dict, List, Iterable, Optional, Callable, Any
 from collections import defaultdict
@@ -12,6 +12,9 @@ import itertools as itt
 from scipy.stats import norm
 from scipy.integrate import quad
 from solver import build_solver
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import pickle
+import shelve
 
 # ── billion-scale helpers ──────────────────────────────────────────────────
 ATTR_NAMES  = ["A1", "A2", "A3"]
@@ -74,8 +77,8 @@ class CompoundHash:
                 As.append(f.a)
                 bs.append(f.b)
                 assert f.w == w, "All L2Hash in a compound family must share the same w"
-            self.A = np.stack(As, axis=0)      # (k, d)
-            self.b = np.asarray(bs)            # (k,)
+            self.A = np.stack(As, axis=0).astype(np.float32)
+            self.b = np.asarray(bs, dtype=np.float32)
             self.w = w
 
     def __call__(self, x: np.ndarray) -> HashKey:
@@ -118,6 +121,99 @@ def make_compound_family(
     funcs = tuple(family_sampler() for _ in range(mu))
     return CompoundHash(funcs)
 
+
+
+# ── helpers for fast parallel index build ────────────────────────────────────
+
+def _make_strides(hashes):
+    """
+    Encode a (mu,) int64 hash key tuple as a single int64 via key_row @ strides.
+    Int dict keys are ~3x faster to hash than tuple keys in CPython.
+    """
+    strides_list = []
+    for g in hashes:
+        mu = len(g.funcs)
+        strides = np.array([1_000_003 ** i for i in range(mu)], dtype=np.int64)
+        strides_list.append(strides)
+    return strides_list
+
+
+def _index_partition_worker(pi, ids, hashes, vec_path, vec_shape,
+                            chunk_size, cache_path=None):
+    """
+    Build LSH tables for one partition.
+
+    When cache_path is given, buckets are written to a shelve file
+    INCREMENTALLY — one chunk at a time — so RAM is bounded to
+    O(chunk_size * d * ell) regardless of partition size.
+
+    Optimisations:
+    1. Chunk-outer / tables-inner: each chunk read from memmap ONCE for all
+       ell tables (ell× fewer disk reads).
+    2. np.unique grouping: replaces per-row Python append loop.
+    3. Integer dict keys via strides dot-product (~3x faster hashing).
+    """
+    import numpy as np
+    import shelve as _shelve
+
+    X        = np.memmap(vec_path, dtype=np.float32, mode="r", shape=vec_shape)
+    ids_arr  = np.sort(np.asarray(ids, dtype=np.int64))
+    n_pi     = len(ids_arr)
+    n_tables = len(hashes)
+    strides  = _make_strides(hashes)
+
+    PRINT_FREQ = 10
+
+    if cache_path is not None:
+        # ── Incremental shelve: write each chunk to disk, never accumulate ────
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with _shelve.open(cache_path, flag="n", writeback=False) as db:
+            for chunk_start in range(0, n_pi, chunk_size):
+
+                if chunk_start % (chunk_size * PRINT_FREQ) == 0:
+                    print(f"[{pi}] {chunk_start}/{n_pi} ({chunk_start*100/n_pi:.1f}%)", flush=True)
+
+                chunk_end = min(chunk_start + chunk_size, n_pi)
+                ids_chunk = ids_arr[chunk_start:chunk_end]
+                X_chunk   = X[ids_chunk].astype(np.float32)  # ONE memmap read
+                for t_idx in range(n_tables):
+                    g        = hashes[t_idx]
+                    st       = strides[t_idx]
+                    key_mat  = g.batch(X_chunk)
+                    encoded  = key_mat @ st
+                    uniq_enc, inverse = np.unique(encoded, return_inverse=True)
+                    for local_idx in range(len(uniq_enc)):
+                        enc     = int(uniq_enc[local_idx])
+                        bkt_ids = ids_chunk[inverse == local_idx].tolist()
+                        skey    = f"{t_idx}:{enc}"
+                        if skey in db:
+                            db[skey] = db[skey] + bkt_ids
+                        else:
+                            db[skey] = bkt_ids
+        return pi, cache_path
+
+    else:
+        # ── In-memory: for small datasets only ───────────────────────────────
+        tables = [{} for _ in hashes]
+        for chunk_start in range(0, n_pi, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_pi)
+            ids_chunk = ids_arr[chunk_start:chunk_end]
+            X_chunk   = X[ids_chunk].astype(np.float32)
+            for t_idx in range(n_tables):
+                g        = hashes[t_idx]
+                T        = tables[t_idx]
+                st       = strides[t_idx]
+                key_mat  = g.batch(X_chunk)
+                encoded  = key_mat @ st
+                uniq_enc, inverse = np.unique(encoded, return_inverse=True)
+                for local_idx in range(len(uniq_enc)):
+                    enc     = int(uniq_enc[local_idx])
+                    bkt_ids = ids_chunk[inverse == local_idx].tolist()
+                    if enc in T:
+                        T[enc].extend(bkt_ids)
+                    else:
+                        T[enc] = bkt_ids
+        return pi, tables
 
 
 # -----------------------------------------
@@ -206,46 +302,6 @@ class L2LSHCartesian:
         result, _ = quad(integrand, 0, w)
         return 2 * result  # account for both sides of distribution
 
-    # def find_R_for_p1(self, target_p1, w, R_min=1e-9, R_max=1e4, tol=1e-6, max_iter=60):
-    #     """
-    #     Solve for R such that collision_probability(R, w) = target_p1.
-        
-    #     Parameters:
-    #         target_p1 : float   # desired collision probability for "near" points
-    #         w         : float   # bucket width for L2-LSH
-    #         R_min     : float   # lower search bound
-    #         R_max     : float   # upper search bound
-    #         tol       : float   # absolute tolerance on p1
-    #         max_iter  : int     # max binary search steps
-        
-    #     Returns:
-    #         float: value of R such that p1 ≈ target_p1
-    #     """
-    #     # Safety checks
-    #     if not (0 < target_p1 < 1):
-    #         raise ValueError("target_p1 must be between 0 and 1")
-
-    #     # Expand R_max until the collision probability drops below target_p1
-    #     while self.collision_probability(R_max, w) > target_p1:
-    #         R_max *= 2
-    #         if R_max > 1e12:
-    #             raise RuntimeError("R too large; check w or target_p1 settings.")
-
-    #     # Binary search
-    #     for _ in range(max_iter):
-    #         R_mid = 0.5 * (R_min + R_max)
-    #         p_mid = self.collision_probability(R_mid, w)
-
-    #         if abs(p_mid - target_p1) < tol:
-    #             return R_mid
-
-    #         if p_mid > target_p1:
-    #             R_min = R_mid  # need larger R to reduce collision probability
-    #         else:
-    #             R_max = R_mid
-
-    #     return 0.5 * (R_min + R_max)  # best estimate
-
     @staticmethod
     def parse_kv_string(s):
         """Parses strings like 'age:30-39__gender:female__race:indian' (or with id)
@@ -278,8 +334,18 @@ class L2LSHCartesian:
         partitions = self.all_carte_attrs
 
         if self.attrs_memmap is not None:
-            # ── Billion-scale path ────────────────────────────────────────────
-            code_to_partition = {}
+            # ── Billion-scale path — fully vectorised ─────────────────────────
+            # Encode each row as a single integer: enc = Σ code_j * stride_j
+            # so we can use numpy boolean masks instead of Python loops.
+            m = self.attrs_memmap.shape[1]
+            strides = []
+            stride = 1
+            for j in range(m - 1, -1, -1):
+                strides.insert(0, stride)
+                stride *= len(ATTR_VALUES[j])
+
+            # Build enc -> partition lookup
+            enc_to_partition = {}
             for p in partitions:
                 tokens = p.split("__")
                 codes = []
@@ -297,22 +363,24 @@ class L2LSHCartesian:
                         valid = False
                         break
                 if valid:
-                    code_to_partition[tuple(codes)] = p
+                    enc = int(sum(c * s for c, s in zip(codes, strides)))
+                    enc_to_partition[enc] = p
 
             out = {p: [] for p in partitions}
             n = self.attrs_memmap.shape[0]
-            chunk = 1_000_000
-            for start in range(0, n, chunk):
+            chunk = 10_000
+            strides_arr = np.array(strides, dtype=np.int64)
+            for start in tqdm.trange(0, n, chunk):
                 end = min(start + chunk, n)
-                batch = self.attrs_memmap[start:end]   # (chunk, m) uint8
-                for local_i in range(end - start):
-                    key = tuple(int(c) for c in batch[local_i])
-                    p = code_to_partition.get(key)
-                    if p is not None:
-                        out[p].append(start + local_i)
-            # convert to numpy arrays for memory efficiency
-            out = {k: np.asarray(v, dtype=np.int64)
-                   for k, v in out.items() if len(v)}
+                batch = self.attrs_memmap[start:end].astype(np.int64)  # (chunk, m)
+                encoded = batch @ strides_arr                            # (chunk,)
+                ids = np.arange(start, end, dtype=np.int64)
+                for enc_val, p in enc_to_partition.items():
+                    mask = encoded == enc_val
+                    if mask.any():
+                        out[p].append(ids[mask])
+
+            out = {k: np.concatenate(v) for k, v in out.items() if v}
             return out
 
         else:
@@ -335,44 +403,152 @@ class L2LSHCartesian:
             return out
 
 
-    def build_index(self, X: np.ndarray, chunk_size: int = 500_000):
+    def _cache_dir(self) -> str:
+        """Directory where per-partition shelve files are stored."""
+        return os.path.join(self.args.data_dir, f"lsh_cache_ell={self.args.ell}")
+
+    def _cache_path(self, pi: str) -> str:
+        """Shelve file prefix for partition pi (shelve appends platform extension)."""
+        safe = pi.replace(":", "_").replace("__", "-")
+        return os.path.join(self._cache_dir(), safe)
+
+    def _shelve_exists(self, pi: str) -> bool:
+        """Check whether the shelve file for this partition already exists."""
+        p = self._cache_path(pi)
+        return (os.path.exists(p) or os.path.exists(p + ".db") or
+                os.path.exists(p + ".dir"))
+
+    def build_index(self, X: np.ndarray,
+                    chunk_size: int = 10_000,
+                    n_workers: int = 1,
+                    use_cache: bool = False):
         """
-        Bulk indexing, one partition at a time in chunks.
+        Build LSH tables for all partitions.
 
-        For billion-scale datasets (attrs_memmap is set), X is a memmap and
-        ids_arr can be very large. We process each partition in chunks of
-        chunk_size rows so that only ~chunk_size * d * 4 bytes live in RAM
-        at once (e.g. 500k * 128 * 4 = 256 MB per chunk).
+        When use_cache=True, each partition is written to a shelve file
+        INCREMENTALLY (chunk by chunk) so RAM never exceeds one chunk's
+        worth of data per worker — regardless of partition or table size.
 
-        For small datasets the behaviour is identical to before.
+        Parameters
+        ----------
+        X          : vector store (np.ndarray or np.memmap)
+        chunk_size : rows per memmap read (bounds RAM)
+        n_workers  : parallel worker processes (1 = sequential)
+        use_cache  : write each partition to disk and free RAM immediately.
+                     Partitions already on disk are skipped (resumable).
+                     search_and_solve() loads from disk on demand.
         """
         assert X.shape[1] == self.d, "Dimension mismatch in build_index"
 
-        for pi, ids in self.partitions.items():
-            if not len(ids):
-                print(f"Warning: partition '{pi}' has no ids; skipping indexing for this partition.")
-                continue
+        vec_path     = os.path.join(self.args.data_dir, "vectors.dat")
+        has_memmap   = os.path.exists(vec_path)
+        use_parallel = n_workers > 1 and has_memmap
 
-            ids_arr = np.asarray(ids, dtype=np.int64)
-            n_pi = len(ids_arr)
+        if use_cache:
+            os.makedirs(self._cache_dir(), exist_ok=True)
 
-            for T, g in zip(self.tables[pi], self.hashes[pi]):
-                # process this partition in chunks to bound RAM usage
-                for chunk_start in range(0, n_pi, chunk_size):
-                    chunk_end = min(chunk_start + chunk_size, n_pi)
-                    ids_chunk = ids_arr[chunk_start:chunk_end]
-                    X_chunk = X[ids_chunk]   # memmap random access — loads only this slice
+        # ── Sequential path ───────────────────────────────────────────────────
+        if not use_parallel:
+            for pi, ids in tqdm.tqdm(self.partitions.items(),
+                                     desc="Indexing partitions"):
+                if not len(ids):
+                    continue
 
-                    # (chunk, mu) int64 hash keys
-                    key_mat = g.batch(X_chunk)
+                if use_cache and self._shelve_exists(pi):
+                    print(f"[build_index] cached — skipping '{pi}'")
+                    self.tables[pi] = self._cache_path(pi)
+                    continue
 
-                    keys_unique, inv = np.unique(key_mat, axis=0, return_inverse=True)
-                    for bucket_idx, key_vec in enumerate(keys_unique):
-                        bucket_ids = ids_chunk[inv == bucket_idx]
-                        if bucket_ids.size == 0:
-                            continue
-                        key = tuple(int(v) for v in key_vec)
-                        T[key].extend(map(int, bucket_ids))
+                ids_arr  = np.sort(np.asarray(ids, dtype=np.int64))
+                n_pi     = len(ids_arr)
+                n_tables = len(self.hashes[pi])
+                strides  = _make_strides(self.hashes[pi])
+
+                if use_cache:
+                    # Incremental shelve — bounded RAM per chunk
+                    with shelve.open(self._cache_path(pi),
+                                     flag="n", writeback=False) as db:
+                        for chunk_start in range(0, n_pi, chunk_size):
+                            chunk_end = min(chunk_start + chunk_size, n_pi)
+                            ids_chunk = ids_arr[chunk_start:chunk_end]
+                            X_chunk   = X[ids_chunk]      # ONE memmap read
+                            for t_idx in range(n_tables):
+                                g        = self.hashes[pi][t_idx]
+                                st       = strides[t_idx]
+                                key_mat  = g.batch(X_chunk)
+                                encoded  = key_mat @ st
+                                uniq_enc, inverse = np.unique(
+                                    encoded, return_inverse=True)
+                                for local_idx in range(len(uniq_enc)):
+                                    enc     = int(uniq_enc[local_idx])
+                                    bkt_ids = ids_chunk[
+                                        inverse == local_idx].tolist()
+                                    skey = f"{t_idx}:{enc}"
+                                    if skey in db:
+                                        db[skey] = db[skey] + bkt_ids
+                                    else:
+                                        db[skey] = bkt_ids
+                    self.tables[pi] = self._cache_path(pi)
+
+                else:
+                    # In-memory — accumulate full tables
+                    tables = [{} for _ in self.hashes[pi]]
+                    for chunk_start in range(0, n_pi, chunk_size):
+                        chunk_end = min(chunk_start + chunk_size, n_pi)
+                        ids_chunk = ids_arr[chunk_start:chunk_end]
+                        X_chunk   = X[ids_chunk]
+                        for t_idx in range(n_tables):
+                            g        = self.hashes[pi][t_idx]
+                            T        = tables[t_idx]
+                            st       = strides[t_idx]
+                            key_mat  = g.batch(X_chunk)
+                            encoded  = key_mat @ st
+                            uniq_enc, inverse = np.unique(
+                                encoded, return_inverse=True)
+                            for local_idx in range(len(uniq_enc)):
+                                enc     = int(uniq_enc[local_idx])
+                                bkt_ids = ids_chunk[
+                                    inverse == local_idx].tolist()
+                                if enc in T:
+                                    T[enc].extend(bkt_ids)
+                                else:
+                                    T[enc] = bkt_ids
+                    self.tables[pi] = tables
+            return
+
+        # ── Parallel path ─────────────────────────────────────────────────────
+        vec_shape = X.shape
+        partitions_list = [(pi, ids) for pi, ids in self.partitions.items()
+                           if len(ids) > 0]
+        n_parts = len(partitions_list)
+        print(f"[build_index] {n_parts} partitions, "
+              f"{n_workers} workers, chunk_size={chunk_size}, "
+              f"use_cache={use_cache}")
+
+        futures = {}
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            for pi, ids in partitions_list:
+                if use_cache and self._shelve_exists(pi):
+                    print(f"[build_index] cached — skipping '{pi}'")
+                    self.tables[pi] = self._cache_path(pi)
+                    continue
+                cache_path = self._cache_path(pi) if use_cache else None
+                fut = pool.submit(
+                    _index_partition_worker,
+                    pi, ids, self.hashes[pi],
+                    vec_path, vec_shape,
+                    chunk_size, cache_path,
+                )
+                futures[fut] = pi
+
+            bar = tqdm.tqdm(total=len(futures), desc="Indexing partitions")
+            for fut in as_completed(futures):
+                pi = futures[fut]
+                pi_result, tables_or_path = fut.result()
+                # tables_or_path is either a str (cache path) or list of dicts
+                self.tables[pi_result] = tables_or_path
+                bar.update(1)
+            bar.close()
 
     # ---- query ----
     def search_and_solve(self, query, vector_store, dfunc, c_min=None):
@@ -429,11 +605,25 @@ class L2LSHCartesian:
 
             all_cands = []
             for pi in info["partitions"]:   # for each matching partition
-                cands = []
-                ell = len(self.tables[pi])
-                k_star = k_pi + math.ceil(2*ell/self.delta)
-                for T, g in zip(self.tables[pi], self.hashes[pi]):
-                    cands.extend(T.get(g(q), ()))
+                cands   = []
+                ell     = len(self.hashes[pi])
+                k_star  = k_pi + math.ceil(2*ell/self.delta)
+                strides = _make_strides(self.hashes[pi])
+
+                if isinstance(self.tables[pi], str):
+                    # on-disk shelve: open, lookup, close
+                    with shelve.open(self.tables[pi], flag="r") as db:
+                        for t_idx, g in enumerate(self.hashes[pi]):
+                            key_vec = np.array(g(q), dtype=np.int64)
+                            enc     = int(key_vec @ strides[t_idx])
+                            cands.extend(db.get(f"{t_idx}:{enc}", []))
+                else:
+                    # in-memory plain dicts with int keys
+                    for t_idx, g in enumerate(self.hashes[pi]):
+                        key_vec = np.array(g(q), dtype=np.int64)
+                        enc     = int(key_vec @ strides[t_idx])
+                        cands.extend(self.tables[pi][t_idx].get(enc, []))
+
                 cands = list(set(cands))[:k_star]
                 all_cands.extend(cands)
                 total_scan += len(cands)

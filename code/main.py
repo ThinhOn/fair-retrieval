@@ -26,8 +26,11 @@ from utils import (
 ## and measure run time, memory cost.
 ## query processing: cost time, quality measures.
 ## TODO: anonymous GITHUB
-## TODO: more related work recently (accepted tO VLDB, SIGMOD, ICDE 26, filtering out vecDB papers)
-## TODO: create SIGMOD submission
+
+## NEW TODO: graphs 
+# (1): x-axis = vary L, y-axis = pre proc time + memory consumption in the same graph.
+# (2) query proc: increase hash functions, increasing k (very high values of k upto 1000), measure time.
+# (3) quality results if available. vary k and show success rates + recall@k.
 
 if __name__ == "__main__":
 
@@ -132,7 +135,12 @@ if __name__ == "__main__":
         attrs_memmap=attrs_memmap,
     )
     mem_before = proc.memory_info().rss
-    db.build_index(vector_store)
+    db.build_index(
+        vector_store,
+        n_workers=4,
+        chunk_size=500_000,
+        use_cache=True,
+    )
     indexing_time = time.time() - start
 
     if is_billion:

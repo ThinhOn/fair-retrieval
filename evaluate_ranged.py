@@ -28,8 +28,10 @@ from collections import defaultdict
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def extract_id(meta_str: str) -> int:
-    """Extract integer id from 'id:123__A1:V1__...' """
+def extract_id(meta_str):
+    # result["selected"] may contain (meta_str, dist) tuples or plain strings
+    if isinstance(meta_str, tuple):
+        meta_str = meta_str[0]
     return int(meta_str.split("__")[0].split(":")[1])
 
 

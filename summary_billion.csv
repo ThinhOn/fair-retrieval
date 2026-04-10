@@ -1,0 +1,2 @@
+method,params,n_queries,recall@k,success_%,avg_search_ms,avg_post_ms,avg_scanned
+l2lsh_cartesian,c=2.0_r=11.475_w=4.0_ell=16_mu=2_delta=0.1,200,0.0,87.0,1725.3084290566755,24.105650695724105,2399.829145728643

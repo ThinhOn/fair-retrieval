@@ -147,7 +147,7 @@ class L2LSHJoint:
             # billion-scale: compute proportions from integer codes in one pass
             n = attrs_memmap.shape[0]
             token_counts = defaultdict(int)
-            chunk = 1_000_000
+            chunk = 10_000
             for start in range(0, n, chunk):
                 end = min(start + chunk, n)
                 batch = attrs_memmap[start:end]
@@ -250,38 +250,50 @@ class L2LSHJoint:
         partitions = self.all_carte_attrs
 
         if self.attrs_memmap is not None:
-            # build lookup: tuple of integer codes -> partition string
-            code_to_partition = {}
+            # Vectorised: encode each row as a single integer key via dot product
+            # with strides, then use numpy boolean mask per partition.
+            m = self.attrs_memmap.shape[1]
+            strides = []
+            stride = 1
+            for j in range(m - 1, -1, -1):
+                strides.insert(0, stride)
+                stride *= len(ATTR_VALUES[j])
+            strides_arr = np.array(strides, dtype=np.int64)
+
+            # Build enc -> partition lookup (direct token split, no lowercasing)
+            enc_to_partition = {}
             for p in partitions:
-                _, feats = self.parse_kv_string(p)
+                tokens = p.split("__")
                 codes = []
                 valid = True
-                for j, name in enumerate(ATTR_NAMES[:self.attrs_memmap.shape[1]]):
-                    val_str = feats.get(name.lower(), feats.get(name, None))
-                    if val_str is None:
-                        valid = False
-                        break
-                    try:
-                        codes.append(ATTR_VALUES[j].index(val_str))
-                    except ValueError:
-                        valid = False
-                        break
+                for token in tokens:
+                    attr, val = token.split(":", 1)
+                    if attr in ATTR_NAMES:
+                        j = ATTR_NAMES.index(attr)
+                        if val in ATTR_VALUES[j]:
+                            codes.append(ATTR_VALUES[j].index(val))
+                        else:
+                            valid = False; break
+                    else:
+                        valid = False; break
                 if valid:
-                    code_to_partition[tuple(codes)] = p
+                    enc = int(sum(c * s for c, s in zip(codes, strides)))
+                    enc_to_partition[enc] = p
 
             out = {p: [] for p in partitions}
             n = self.attrs_memmap.shape[0]
-            chunk = 1_000_000
+            chunk = 10_000
             for start in range(0, n, chunk):
                 end = min(start + chunk, n)
-                batch = self.attrs_memmap[start:end]
-                for local_i in range(end - start):
-                    key = tuple(int(c) for c in batch[local_i])
-                    p = code_to_partition.get(key)
-                    if p is not None:
-                        out[p].append(start + local_i)
-            out = {k: np.asarray(v, dtype=np.int64)
-                   for k, v in out.items() if len(v)}
+                batch = self.attrs_memmap[start:end].astype(np.int64)  # (chunk, m)
+                encoded = batch @ strides_arr                            # (chunk,)
+                ids = np.arange(start, end, dtype=np.int64)
+                for enc_val, p in enc_to_partition.items():
+                    mask = encoded == enc_val
+                    if mask.any():
+                        out[p].append(ids[mask])
+
+            out = {k: np.concatenate(v) for k, v in out.items() if v}
             return out
 
         else:
@@ -317,31 +329,36 @@ class L2LSHJoint:
     #     for T, g in zip(self.tables[pi], self.hashes[pi]):
     #         T[g(vec)].append(object_id)
 
-    def build_index(self, X: np.ndarray, chunk_size: int = 500_000):
+    def build_index(self, X: np.ndarray, chunk_size: int = 10_000):
         """
         Bulk indexing, one partition at a time in chunks.
-        For billion-scale datasets, processes each partition in chunks of
-        chunk_size rows so that only ~chunk_size * d * 4 bytes live in RAM.
+
+        Optimisations for billion-scale:
+        - ids_arr is sorted so memmap accesses are sequential (avoids random seeks).
+        - Hash keys inserted with plain per-row append (no np.unique sort overhead).
+        - chunk_size bounds RAM to chunk_size * d * 4 bytes per iteration.
         """
         assert X.shape[1] == self.d, "Dimension mismatch in build_index"
 
         for pi, ids in self.partitions.items():
-            if not ids:
+            if not len(ids):
                 continue
-            ids_arr = np.asarray(ids, dtype=np.int64)
+
+            # Sort ids for sequential memmap access
+            ids_arr = np.sort(np.asarray(ids, dtype=np.int64))
             n_pi = len(ids_arr)
 
             for T, g in zip(self.tables[pi], self.hashes[pi]):
                 for chunk_start in range(0, n_pi, chunk_size):
                     chunk_end = min(chunk_start + chunk_size, n_pi)
                     ids_chunk = ids_arr[chunk_start:chunk_end]
-                    X_chunk = X[ids_chunk]   # memmap random access
+                    X_chunk = X[ids_chunk]   # sequential read after sorting
 
                     key_mat = g.batch(X_chunk)
 
-                    for obj_id, key_row in zip(ids_chunk, key_mat):
-                        key = tuple(key_row.tolist())
-                        T[key].append(int(obj_id))
+                    for i in range(len(ids_chunk)):
+                        key = tuple(key_mat[i].tolist())
+                        T[key].append(int(ids_chunk[i]))
 
     # ---- query ----
     def search_and_solve(self, query, vector_store, dfunc):

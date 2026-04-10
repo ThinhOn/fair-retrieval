@@ -23,38 +23,39 @@ fi
 
 
 ### vary W
-L=16
-MU=2
-for W in 4.0 6.0 8.0 10.0; do
-    echo ""
-    echo "${INDEX}, ${DATASET}, ${FDIST}, c = ${C}, L = ${L}, w = ${W}", mu = ${MU}
-    OPTS=""
-    #data
-    OPTS+=" --data-dir ${DATA_DIR}"
-    #index
-    OPTS+=" --index ${INDEX}"
-    OPTS+=" --c ${C}"
-    # OPTS+=" --r ${R}"
-    OPTS+=" --w ${W}"
-    OPTS+=" --ell ${L}"
-    OPTS+=" --mu ${MU}"
-    OPTS+=" --m ${M}"
-    OPTS+=" --fdist ${FDIST}"
-    OPTS+=" --delta ${DELTA}"
-    #solver
-    OPTS+=" --solver ${SOLVER}"
-    # runtime
-    OPTS+=" --seed 10"
+# L=16
+# MU=2
+# for W in 4.0 6.0 8.0 10.0; do
+#     echo ""
+#     echo "${INDEX}, ${DATASET}, ${FDIST}, c = ${C}, L = ${L}, w = ${W}", mu = ${MU}
+#     OPTS=""
+#     #data
+#     OPTS+=" --data-dir ${DATA_DIR}"
+#     #index
+#     OPTS+=" --index ${INDEX}"
+#     OPTS+=" --c ${C}"
+#     # OPTS+=" --r ${R}"
+#     OPTS+=" --w ${W}"
+#     OPTS+=" --ell ${L}"
+#     OPTS+=" --mu ${MU}"
+#     OPTS+=" --m ${M}"
+#     OPTS+=" --fdist ${FDIST}"
+#     OPTS+=" --delta ${DELTA}"
+#     #solver
+#     OPTS+=" --solver ${SOLVER}"
+#     # runtime
+#     OPTS+=" --seed 10"
 
-    CMD="python ${BASE_PATH}/code/main.py ${OPTS}"
-    ${CMD}
-done
+#     CMD="python ${BASE_PATH}/code/main.py ${OPTS}"
+#     ${CMD}
+# done
 
 
 ### vary ell
 W=4.0
 MU=2
-for L in 8 16 32 64 128; do
+for L in 32; do
+# for L in 8 16 32 64 128; do
     echo ""
     echo "${INDEX}, ${DATASET}, ${FDIST}, c = ${C}, L = ${L}, w = ${W}", mu = ${MU}
     OPTS=""
@@ -81,31 +82,31 @@ done
 
 
 ### vary concat length
-W=4.0
-L=16
-for MU in 1 2 4 8; do
-    echo ""
-    echo "${INDEX}, ${DATASET}, ${FDIST}, c = ${C}, L = ${L}, w = ${W}", mu = ${MU}
-    OPTS=""
-    #data
-    OPTS+=" --data-dir ${DATA_DIR}"
-    #index
-    OPTS+=" --index ${INDEX}"
-    OPTS+=" --c ${C}"
-    # OPTS+=" --r ${R}"
-    OPTS+=" --w ${W}"
-    OPTS+=" --ell ${L}"
-    OPTS+=" --mu ${MU}"
-    OPTS+=" --m ${M}"
-    OPTS+=" --fdist ${FDIST}"
-    OPTS+=" --delta ${DELTA}"
-    #solver
-    OPTS+=" --solver ${SOLVER}"
-    # runtime
-    OPTS+=" --seed 10"
-    CMD="python ${BASE_PATH}/code/main.py ${OPTS}"
-    ${CMD}
-done
+# W=4.0
+# L=16
+# for MU in 1 2 4 8; do
+#     echo ""
+#     echo "${INDEX}, ${DATASET}, ${FDIST}, c = ${C}, L = ${L}, w = ${W}", mu = ${MU}
+#     OPTS=""
+#     #data
+#     OPTS+=" --data-dir ${DATA_DIR}"
+#     #index
+#     OPTS+=" --index ${INDEX}"
+#     OPTS+=" --c ${C}"
+#     # OPTS+=" --r ${R}"
+#     OPTS+=" --w ${W}"
+#     OPTS+=" --ell ${L}"
+#     OPTS+=" --mu ${MU}"
+#     OPTS+=" --m ${M}"
+#     OPTS+=" --fdist ${FDIST}"
+#     OPTS+=" --delta ${DELTA}"
+#     #solver
+#     OPTS+=" --solver ${SOLVER}"
+#     # runtime
+#     OPTS+=" --seed 10"
+#     CMD="python ${BASE_PATH}/code/main.py ${OPTS}"
+#     ${CMD}
+# done
 
 
 ### for debugging
