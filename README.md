@@ -1,7 +1,7 @@
 # fair-retrieval
 
 Vectors + metadata + query files are uploaded here:
-[https://drive.google.com/drive/folders/1U6i5AlConrcAI08OJexGGPtJ697RiwKU](https://drive.google.com/file/d/1zY5czyfe4k0sr16I1SQsOC579e7RwnRg/view?usp=sharing)
+https://drive.google.com/file/d/1lOWWQEBMFlTQdQXw_EaysLGgBLbivOkq/view?usp=sharing
 
 Download and unzip in the main project folder.
 
