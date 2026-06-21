@@ -15,6 +15,59 @@ from solver import build_solver
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import pickle
 import shelve
+import sqlite3
+
+
+# ── on-disk per-partition bucket store ───────────────────────────────────────
+# Backend = SQLite, NOT shelve. On Windows shelve falls back to dbm.dumb, which
+# rewrites its whole index on every key (O(K^2) + an fsync per key): ~31 s to
+# write 5600 keys. SQLite writes the same in ~0.02 s (one batched transaction)
+# and still gives fast random-access point reads by key — essential at billion
+# scale. Each partition is one .sqlite file; values are int64 id arrays as BLOBs.
+
+def _sql_path(cache_path: str) -> str:
+    return cache_path + ".sqlite"
+
+
+def _sql_exists(cache_path: str) -> bool:
+    return os.path.exists(_sql_path(cache_path))
+
+
+def _sql_write(cache_path: str, acc: list) -> None:
+    """Write acc[t_idx][kb] -> [id arrays] to a fresh SQLite file, one txn."""
+    p = _sql_path(cache_path)
+    if os.path.exists(p):
+        os.remove(p)
+    con = sqlite3.connect(p)
+    try:
+        con.execute("PRAGMA journal_mode=OFF")
+        con.execute("PRAGMA synchronous=OFF")
+        con.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v BLOB)")
+
+        def rows():
+            for t_idx in range(len(acc)):
+                for kb, arrs in acc[t_idx].items():
+                    # ids < n <= 1e9 < 2**31, so int32 suffices — halves the
+                    # index size on disk and the accumulation RAM.
+                    ids = np.concatenate(arrs).astype(np.int32)
+                    yield (f"{t_idx}:{kb.hex()}", ids.tobytes())
+
+        con.executemany("INSERT OR REPLACE INTO kv VALUES (?, ?)", rows())
+        con.commit()
+    finally:
+        con.close()
+
+
+def _sql_open_ro(cache_path: str) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{_sql_path(cache_path)}?mode=ro", uri=True)
+
+
+def _sql_get(con: sqlite3.Connection, t_idx: int, kb: bytes) -> list:
+    row = con.execute("SELECT v FROM kv WHERE k=?",
+                      (f"{t_idx}:{kb.hex()}",)).fetchone()
+    if row is None:
+        return []
+    return np.frombuffer(row[0], dtype=np.int32).tolist()
 
 # ── billion-scale helpers ──────────────────────────────────────────────────
 ATTR_NAMES  = ["A1", "A2", "A3"]
@@ -125,17 +178,30 @@ def make_compound_family(
 
 # ── helpers for fast parallel index build ────────────────────────────────────
 
-def _make_strides(hashes):
+def _group_key_rows(key_mat: np.ndarray):
     """
-    Encode a (mu,) int64 hash key tuple as a single int64 via key_row @ strides.
-    Int dict keys are ~3x faster to hash than tuple keys in CPython.
+    Group identical hash-key rows of a (n, mu) int64 matrix.
+
+    Returns (unique_keys, inverse) where:
+      - unique_keys[k] is a stable `bytes` key for the k-th unique row,
+      - inverse[i] is the index of row i's unique key.
+
+    Using the raw row bytes as the key (instead of a polynomial int encoding)
+    is overflow-free for ANY concatenation length mu. The old int encoding
+    (base 1_000_003 ** i) overflowed int64 once mu > 3, which made the
+    theory-prescribed auto-scaled mu (mu=0 → mu≈log n / log(1/p2), often 8–13
+    on large partitions) impossible to build.
     """
-    strides_list = []
-    for g in hashes:
-        mu = len(g.funcs)
-        strides = np.array([1_000_003 ** i for i in range(mu)], dtype=np.int64)
-        strides_list.append(strides)
-    return strides_list
+    uniq, inverse = np.unique(key_mat, axis=0, return_inverse=True)
+    inverse = np.asarray(inverse).reshape(-1)
+    uniq = np.ascontiguousarray(uniq)
+    keys = [uniq[k].tobytes() for k in range(uniq.shape[0])]
+    return keys, inverse
+
+
+def _query_key(g, q) -> bytes:
+    """Stable bytes key for a single query vector under compound hash g."""
+    return np.asarray(g(q), dtype=np.int64).tobytes()
 
 
 def _index_partition_worker(pi, ids, hashes, vec_path, vec_shape,
@@ -143,53 +209,47 @@ def _index_partition_worker(pi, ids, hashes, vec_path, vec_shape,
     """
     Build LSH tables for one partition.
 
-    When cache_path is given, buckets are written to a shelve file
-    INCREMENTALLY — one chunk at a time — so RAM is bounded to
-    O(chunk_size * d * ell) regardless of partition size.
+    When cache_path is given, each partition's buckets are accumulated in RAM
+    across all chunks and then written to shelve ONCE per key. RAM is bounded
+    to O(n_pi * ell) ids (plus one chunk of vectors). This avoids the
+    quadratic read-modify-write (`db[k] = db[k] + ids` per chunk) that makes
+    dbm.dumb — the only shelve backend on Windows — pathologically slow when
+    coarse (small-mu) buckets hold millions of ids each.
 
     Optimisations:
     1. Chunk-outer / tables-inner: each chunk read from memmap ONCE for all
        ell tables (ell× fewer disk reads).
     2. np.unique grouping: replaces per-row Python append loop.
-    3. Integer dict keys via strides dot-product (~3x faster hashing).
+    3. One shelve write per key (no per-chunk read-modify-write).
     """
     import numpy as np
-    import shelve as _shelve
+    from collections import defaultdict as _dd
 
     X        = np.memmap(vec_path, dtype=np.float32, mode="r", shape=vec_shape)
     ids_arr  = np.sort(np.asarray(ids, dtype=np.int64))
     n_pi     = len(ids_arr)
     n_tables = len(hashes)
-    strides  = _make_strides(hashes)
 
     PRINT_FREQ = 10
 
     if cache_path is not None:
-        # ── Incremental shelve: write each chunk to disk, never accumulate ────
+        # ── Accumulate in RAM (bucket -> list of id arrays), write once ───────
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        with _shelve.open(cache_path, flag="n", writeback=False) as db:
-            for chunk_start in range(0, n_pi, chunk_size):
-
-                if chunk_start % (chunk_size * PRINT_FREQ) == 0:
-                    print(f"[{pi}] {chunk_start}/{n_pi} ({chunk_start*100/n_pi:.1f}%)", flush=True)
-
-                chunk_end = min(chunk_start + chunk_size, n_pi)
-                ids_chunk = ids_arr[chunk_start:chunk_end]
-                X_chunk   = X[ids_chunk].astype(np.float32)  # ONE memmap read
-                for t_idx in range(n_tables):
-                    g        = hashes[t_idx]
-                    st       = strides[t_idx]
-                    key_mat  = g.batch(X_chunk)
-                    encoded  = key_mat @ st
-                    uniq_enc, inverse = np.unique(encoded, return_inverse=True)
-                    for local_idx in range(len(uniq_enc)):
-                        enc     = int(uniq_enc[local_idx])
-                        bkt_ids = ids_chunk[inverse == local_idx].tolist()
-                        skey    = f"{t_idx}:{enc}"
-                        if skey in db:
-                            db[skey] = db[skey] + bkt_ids
-                        else:
-                            db[skey] = bkt_ids
+        acc = [_dd(list) for _ in range(n_tables)]   # acc[t][kb] -> [id arrays]
+        for chunk_start in range(0, n_pi, chunk_size):
+            if chunk_start % (chunk_size * PRINT_FREQ) == 0:
+                print(f"[{pi}] {chunk_start}/{n_pi} ({chunk_start*100/n_pi:.1f}%)", flush=True)
+            chunk_end = min(chunk_start + chunk_size, n_pi)
+            ids_chunk = ids_arr[chunk_start:chunk_end]
+            X_chunk   = X[ids_chunk].astype(np.float32)  # ONE memmap read
+            for t_idx in range(n_tables):
+                g        = hashes[t_idx]
+                key_mat  = g.batch(X_chunk)
+                keys, inverse = _group_key_rows(key_mat)
+                at = acc[t_idx]
+                for local_idx, kb in enumerate(keys):
+                    at[kb].append(ids_chunk[inverse == local_idx].astype(np.int32))
+        _sql_write(cache_path, acc)
         return pi, cache_path
 
     else:
@@ -202,17 +262,14 @@ def _index_partition_worker(pi, ids, hashes, vec_path, vec_shape,
             for t_idx in range(n_tables):
                 g        = hashes[t_idx]
                 T        = tables[t_idx]
-                st       = strides[t_idx]
                 key_mat  = g.batch(X_chunk)
-                encoded  = key_mat @ st
-                uniq_enc, inverse = np.unique(encoded, return_inverse=True)
-                for local_idx in range(len(uniq_enc)):
-                    enc     = int(uniq_enc[local_idx])
+                keys, inverse = _group_key_rows(key_mat)
+                for local_idx, kb in enumerate(keys):
                     bkt_ids = ids_chunk[inverse == local_idx].tolist()
-                    if enc in T:
-                        T[enc].extend(bkt_ids)
+                    if kb in T:
+                        T[kb].extend(bkt_ids)
                     else:
-                        T[enc] = bkt_ids
+                        T[kb] = bkt_ids
         return pi, tables
 
 
@@ -404,8 +461,17 @@ class L2LSHCartesian:
 
 
     def _cache_dir(self) -> str:
-        """Directory where per-partition shelve files are stored."""
-        return os.path.join(self.args.data_dir, f"lsh_cache_ell={self.args.ell}")
+        """Directory where per-partition shelve files are stored.
+
+        The key includes every parameter that changes the hash functions
+        (ell, mu, w, c, seed) so that changing any of them does not silently
+        reuse stale buckets built under different settings.
+        """
+        return os.path.join(
+            self.args.data_dir,
+            f"lsh_cache_ell={self.args.ell}_mu={self.args.mu}"
+            f"_w={self.args.w}_c={self.args.c}_seed={self.args.seed}",
+        )
 
     def _cache_path(self, pi: str) -> str:
         """Shelve file prefix for partition pi (shelve appends platform extension)."""
@@ -413,10 +479,8 @@ class L2LSHCartesian:
         return os.path.join(self._cache_dir(), safe)
 
     def _shelve_exists(self, pi: str) -> bool:
-        """Check whether the shelve file for this partition already exists."""
-        p = self._cache_path(pi)
-        return (os.path.exists(p) or os.path.exists(p + ".db") or
-                os.path.exists(p + ".dir"))
+        """Check whether the on-disk cache for this partition already exists."""
+        return _sql_exists(self._cache_path(pi))
 
     def build_index(self, X: np.ndarray,
                     chunk_size: int = 10_000,
@@ -462,32 +526,22 @@ class L2LSHCartesian:
                 ids_arr  = np.sort(np.asarray(ids, dtype=np.int64))
                 n_pi     = len(ids_arr)
                 n_tables = len(self.hashes[pi])
-                strides  = _make_strides(self.hashes[pi])
 
                 if use_cache:
-                    # Incremental shelve — bounded RAM per chunk
-                    with shelve.open(self._cache_path(pi),
-                                     flag="n", writeback=False) as db:
-                        for chunk_start in range(0, n_pi, chunk_size):
-                            chunk_end = min(chunk_start + chunk_size, n_pi)
-                            ids_chunk = ids_arr[chunk_start:chunk_end]
-                            X_chunk   = X[ids_chunk]      # ONE memmap read
-                            for t_idx in range(n_tables):
-                                g        = self.hashes[pi][t_idx]
-                                st       = strides[t_idx]
-                                key_mat  = g.batch(X_chunk)
-                                encoded  = key_mat @ st
-                                uniq_enc, inverse = np.unique(
-                                    encoded, return_inverse=True)
-                                for local_idx in range(len(uniq_enc)):
-                                    enc     = int(uniq_enc[local_idx])
-                                    bkt_ids = ids_chunk[
-                                        inverse == local_idx].tolist()
-                                    skey = f"{t_idx}:{enc}"
-                                    if skey in db:
-                                        db[skey] = db[skey] + bkt_ids
-                                    else:
-                                        db[skey] = bkt_ids
+                    # Accumulate in RAM, write each key once (see worker docstring)
+                    acc = [defaultdict(list) for _ in range(n_tables)]
+                    for chunk_start in range(0, n_pi, chunk_size):
+                        chunk_end = min(chunk_start + chunk_size, n_pi)
+                        ids_chunk = ids_arr[chunk_start:chunk_end]
+                        X_chunk   = X[ids_chunk]      # ONE memmap read
+                        for t_idx in range(n_tables):
+                            g        = self.hashes[pi][t_idx]
+                            key_mat  = g.batch(X_chunk)
+                            keys, inverse = _group_key_rows(key_mat)
+                            at = acc[t_idx]
+                            for local_idx, kb in enumerate(keys):
+                                at[kb].append(ids_chunk[inverse == local_idx].astype(np.int32))
+                    _sql_write(self._cache_path(pi), acc)
                     self.tables[pi] = self._cache_path(pi)
 
                 else:
@@ -500,19 +554,15 @@ class L2LSHCartesian:
                         for t_idx in range(n_tables):
                             g        = self.hashes[pi][t_idx]
                             T        = tables[t_idx]
-                            st       = strides[t_idx]
                             key_mat  = g.batch(X_chunk)
-                            encoded  = key_mat @ st
-                            uniq_enc, inverse = np.unique(
-                                encoded, return_inverse=True)
-                            for local_idx in range(len(uniq_enc)):
-                                enc     = int(uniq_enc[local_idx])
+                            keys, inverse = _group_key_rows(key_mat)
+                            for local_idx, kb in enumerate(keys):
                                 bkt_ids = ids_chunk[
                                     inverse == local_idx].tolist()
-                                if enc in T:
-                                    T[enc].extend(bkt_ids)
+                                if kb in T:
+                                    T[kb].extend(bkt_ids)
                                 else:
-                                    T[enc] = bkt_ids
+                                    T[kb] = bkt_ids
                     self.tables[pi] = tables
             return
 
@@ -608,21 +658,20 @@ class L2LSHCartesian:
                 cands   = []
                 ell     = len(self.hashes[pi])
                 k_star  = k_pi + math.ceil(2*ell/self.delta)
-                strides = _make_strides(self.hashes[pi])
 
                 if isinstance(self.tables[pi], str):
-                    # on-disk shelve: open, lookup, close
-                    with shelve.open(self.tables[pi], flag="r") as db:
+                    # on-disk SQLite: open read-only, point-lookup per table, close
+                    con = _sql_open_ro(self.tables[pi])
+                    try:
                         for t_idx, g in enumerate(self.hashes[pi]):
-                            key_vec = np.array(g(q), dtype=np.int64)
-                            enc     = int(key_vec @ strides[t_idx])
-                            cands.extend(db.get(f"{t_idx}:{enc}", []))
+                            cands.extend(_sql_get(con, t_idx, _query_key(g, q)))
+                    finally:
+                        con.close()
                 else:
-                    # in-memory plain dicts with int keys
+                    # in-memory plain dicts with bytes keys
                     for t_idx, g in enumerate(self.hashes[pi]):
-                        key_vec = np.array(g(q), dtype=np.int64)
-                        enc     = int(key_vec @ strides[t_idx])
-                        cands.extend(self.tables[pi][t_idx].get(enc, []))
+                        kb = _query_key(g, q)
+                        cands.extend(self.tables[pi][t_idx].get(kb, []))
 
                 cands = list(set(cands))[:k_star]
                 all_cands.extend(cands)

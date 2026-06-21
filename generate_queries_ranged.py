@@ -5,7 +5,10 @@ sys.path.extend([
 import json
 import tqdm
 import heapq
-import torch
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
 import pickle
 import random
 import argparse
@@ -31,7 +34,7 @@ ATTR_VALUES = [
 seed = 10
 set_seed(seed)
 rng = default_rng(seed)
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cuda' if (torch is not None and torch.cuda.is_available()) else 'cpu'
 
 
 def generate_complex_queries(

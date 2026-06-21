@@ -53,6 +53,10 @@ def add_runtime_args(parser: argparse.ArgumentParser):
     group.add_argument('--seed', type=int, default=10)
     group.add_argument("--chunk_size", type=int, default=10_000)
     group.add_argument("--n_workers",  type=int, default=16)
+    # Index build backend: shelve-on-disk cache (bounded RAM, needed at
+    # billion-scale) vs in-memory (fast for any mu, fits 1M–10M in RAM).
+    group.add_argument("--use-cache", dest="use_cache",
+                       action="store_true", default=False)
     return parser
 
 

@@ -3,13 +3,26 @@ import numpy as np
 import os
 import math
 import tqdm
-import torch
-from PIL import Image
 import multiprocessing as mp
 from itertools import repeat
-from datasets import load_dataset
 import pandas as pd
-import bitarray
+# Heavy / image-only deps — optional so the vector pipeline runs without them.
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
+try:
+    from PIL import Image
+except ModuleNotFoundError:
+    Image = None
+try:
+    from datasets import load_dataset
+except ModuleNotFoundError:
+    load_dataset = None
+try:
+    import bitarray
+except ModuleNotFoundError:
+    bitarray = None
 import typing as t
 from functools import partial
 from itertools import combinations, repeat
@@ -18,8 +31,9 @@ from itertools import combinations, repeat
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    if torch is not None:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
 
 
 def load_occupation_data(

@@ -21,12 +21,6 @@ from utils import (
     get_dist_func,
 )
 
-
-## TODO: make sure to vary hashing parameters when working with billion scale data
-## and measure run time, memory cost.
-## query processing: cost time, quality measures.
-## TODO: anonymous GITHUB
-
 ## NEW TODO: graphs 
 # (1): x-axis = vary L, y-axis = pre proc time + memory consumption in the same graph.
 # (2) query proc: increase hash functions, increasing k (very high values of k upto 1000), measure time.

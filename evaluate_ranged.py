@@ -63,8 +63,12 @@ def is_feasible(result: dict, query: dict) -> bool:
     return True
 
 
-def recall_at_k(result: dict, query: dict) -> float:
-    """Fraction of ground-truth ids recovered in the result."""
+def recall_at_k(result: dict, query: dict):
+    """Fraction of ground-truth ids recovered in the result.
+    Returns None when the query carries no ground truth (e.g. the 1B run,
+    where exact ground truth over 1e9 vectors is infeasible)."""
+    if "ground_truth" not in query:
+        return None
     k = int(query["k"])
     if not result.get("selected"):
         return 0.0
@@ -97,10 +101,13 @@ def evaluate_file(result_path: str, queries: list[dict]) -> dict:
     n = min(len(results), len(queries))
 
     recalls = []
+    dafs = []
     feasible_flags = []
     search_times = []
     post_times = []
     scanned = []
+
+    has_ground_truth = bool(queries) and ("ground_truth" in queries[0])
 
     for i in range(n):
         res = results[i]
@@ -108,11 +115,21 @@ def evaluate_file(result_path: str, queries: list[dict]) -> dict:
 
         # Treat empty / None result as failure
         if not res or not res.get("selected"):
-            recalls.append(0.0)
+            if has_ground_truth:
+                recalls.append(0.0)
             feasible_flags.append(False)
             continue
 
-        recalls.append(recall_at_k(res, q))
+        r = recall_at_k(res, q)
+        if r is not None:
+            recalls.append(r)
+        # DAF = (our total distance) / (ground-truth optimal distance), >= 1.
+        # Captures distance quality where exact-ID recall is misleading (e.g.
+        # clustered data with many near-equidistant points).
+        gt_dist = q.get("ground_truth_dist")
+        obj = res.get("objective")
+        if gt_dist and obj and gt_dist > 0 and is_feasible(res, q):
+            dafs.append(obj / gt_dist)
         feasible_flags.append(is_feasible(res, q))
         search_times.append(res.get("search_time", 0.0))
         post_times.append(res.get("postprocessing_time", 0.0))
@@ -123,7 +140,9 @@ def evaluate_file(result_path: str, queries: list[dict]) -> dict:
 
     return {
         "n_queries":        total,
-        "recall@k":         sum(recalls) / total if total else 0.0,
+        # NaN when no ground truth (1B): recall@k is not measurable there.
+        "recall@k":         (sum(recalls) / len(recalls)) if recalls else float("nan"),
+        "DAF":              (sum(dafs) / len(dafs)) if dafs else float("nan"),
         "success_%":        100.0 * success / total if total else 0.0,
         "avg_search_ms":    1000 * sum(search_times) / len(search_times) if search_times else 0.0,
         "avg_post_ms":      1000 * sum(post_times)   / len(post_times)   if post_times   else 0.0,
