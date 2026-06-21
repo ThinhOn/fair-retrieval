@@ -14,6 +14,14 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import re
 
+plt.rcParams.update({
+    "savefig.dpi": 300, "font.size": 12,
+    "axes.titlesize": 13, "axes.labelsize": 13,
+    "xtick.labelsize": 11, "ytick.labelsize": 11, "legend.fontsize": 11,
+    "axes.grid": True, "grid.alpha": 0.3, "savefig.bbox": "tight",
+    "lines.linewidth": 2, "lines.markersize": 7,
+})
+
 scal = pd.read_csv("scalability_bigann_1b.csv").sort_values("ell")
 
 q = pd.read_csv("summary_bigann_1b.csv")
