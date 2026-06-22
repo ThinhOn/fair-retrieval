@@ -80,6 +80,21 @@ Real-world datasets, ℓ2, low config (nprobe 1/4/8):
 (CelebA search is ~220 ms because metadata carries 5 attributes → 4^5=1024
 partitions, many probed per m=2 query.)
 
+CelebA across m (IVF, nprobe 1/4/8). NOTE: m=1,3,4,5 use the pre-existing
+EXACT-count queries (queries_k=5_m=N^5_*.pkl, which carry ground truth), while
+m=2 above used ranged constraints — exact counts are stricter, so success% falls
+sharply with m (the multi-attribute hardness). DAF stays near-optimal throughout.
+
+| m | recall@k (np 1/4/8) | DAF@8 | success% | search ms |
+|--:|---|---:|---:|---:|
+| 1 | 0.668 / 0.905 / 0.959 | 1.004 | 100.0 | 369 |
+| 3 | 0.768 / 0.908 / 0.927 | 1.001 | 83.5  | 132 |
+| 4 | 0.708 / 0.815 / 0.835 | 1.001 | 55.0  | 79  |
+| 5 | 0.662 / 0.735 / 0.752 | 1.000 | 19.0  | 47  |
+
+Source: `summary_ivf_celeba_m={1,3,4,5}.csv`. The IVF index is identical across m
+(partitioning is by all 5 attrs), so all these reuse the one built CelebA cache.
+
 Real-SIFT subset (1M, d=128, with ground truth) — IVF vs LSH at scale:
 
 | nprobe | recall@k | DAF | success% | search ms |

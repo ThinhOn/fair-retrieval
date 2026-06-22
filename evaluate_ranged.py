@@ -56,8 +56,10 @@ def is_feasible(result: dict, query: dict) -> bool:
     """
     for attr, val_ranges in query["count"].items():
         result_counts = result.get("count", {}).get(attr, {})
-        for val, (lb, ub) in val_ranges.items():
+        for val, c in val_ranges.items():
             got = result_counts.get(val, 0)
+            # ranged constraint (lb, ub) tuple, or exact-count int
+            lb, ub = (c if isinstance(c, (tuple, list)) else (int(c), int(c)))
             if not (lb <= got <= ub):
                 return False
     return True

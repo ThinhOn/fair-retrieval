@@ -156,10 +156,13 @@ if __name__ == "__main__":
     avg_post = 0.
     for k in [5,]:
     # for k in [5, 10, 15, 20, 25]:
-        ## load query file
-        # query_suffix = f"k={k}_m={args.m}^5_fdist={args.fdist}_200"
+        ## load query file (explicit override, else default ranged naming)
         query_suffix = f"k={k}_m={args.m}_fdist={args.fdist}_200"
-        query_path = f"{args.data_dir}/ranged_queries_{query_suffix}.pkl"
+        if getattr(args, "query_file", None):
+            query_path = args.query_file
+            query_suffix = args.query_tag or os.path.splitext(os.path.basename(query_path))[0]
+        else:
+            query_path = f"{args.data_dir}/ranged_queries_{query_suffix}.pkl"
         with open(query_path, 'rb') as f:
             queries = pickle.load(f)
 

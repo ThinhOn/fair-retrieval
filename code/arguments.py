@@ -60,6 +60,11 @@ def add_runtime_args(parser: argparse.ArgumentParser):
     group.add_argument('--seed', type=int, default=10)
     group.add_argument("--chunk_size", type=int, default=10_000)
     group.add_argument("--n_workers",  type=int, default=16)
+    # Optional explicit query file + result tag (overrides the default
+    # ranged_queries_k=..._m=..._fdist=..._200 naming). Used e.g. to point at
+    # the pre-existing exact-count CelebA queries_k=5_m=N^5_*.pkl files.
+    group.add_argument("--query-file", dest="query_file", type=str, default=None)
+    group.add_argument("--query-tag",  dest="query_tag",  type=str, default=None)
     # Index build backend: shelve-on-disk cache (bounded RAM, needed at
     # billion-scale) vs in-memory (fast for any mu, fits 1M–10M in RAM).
     group.add_argument("--use-cache", dest="use_cache",
