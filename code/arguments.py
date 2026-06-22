@@ -30,6 +30,13 @@ def add_LSH_args(parser: argparse.ArgumentParser):
         help="distance function")
     group.add_argument('--delta', type=float, default=0.1,
         help="overall failure probability")
+    # IVF (l2ivf_cartesian) parameters
+    group.add_argument('--nlist', type=int, default=0,
+        help="IVF cells per partition (0 = auto: 4*sqrt(n_pi))")
+    group.add_argument('--nprobe', type=int, default=8,
+        help="IVF cells probed at query time (the IVF effort knob)")
+    group.add_argument('--oversample', type=int, default=100,
+        help="IVF: extra candidates retrieved per partition beyond k_pi")
     # group.add_argument('--max-K', type=int, default=10,
     #     help="max possible K (anticipated) for all possible queries")
     # group.add_argument('--num-tables', type=int, default=5,

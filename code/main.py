@@ -91,7 +91,7 @@ if __name__ == "__main__":
     """
     Compute R
     """
-    if "lsh" in args.index:
+    if "lsh" in args.index and "ivf" not in args.index:
         # sample K points
         sample = vector_store[np.random.choice(len(vector_store), size=5000, replace=False)]
         nn_dists = []
@@ -102,7 +102,9 @@ if __name__ == "__main__":
         args.r = round(np.percentile(nn_dists, 50) * 2, 5)
         
     ## indexing params
-    if "lsh" in args.index:
+    if "ivf" in args.index:
+        INDEX = f"{args.index}/nlist={args.nlist}_nprobe={args.nprobe}_over={args.oversample}"
+    elif "lsh" in args.index:
         INDEX = f"{args.index}/c={args.c}_r={args.r:.3f}_w={args.w}_ell={args.ell}_mu={args.mu}_delta={args.delta}"
     elif "sieve" in args.index:
         INDEX = f"{args.index}/efc={args.ef_construction}_M={args.M}_efs={args.ef_search}"

@@ -2,6 +2,7 @@ from .lsh_cartesian import LSHCartesian
 from .lsh_cartesian_tree import LSHCartesianTree
 from .lsh_single import LSHSingle
 from .l2lsh_cartesian import L2LSHCartesian
+from .l2ivf_cartesian import L2IVFCartesian
 from .l2lsh_single import L2LSHSingle
 from .l2lsh_joint import L2LSHJoint
 from .brute_force_cartesian import BruteForceCartesian
@@ -14,6 +15,7 @@ indexes = {
     # "lsh_single": LSHSingle,
     # "lsh_cartesian_tree": LSHCartesianTree,
     "l2lsh_cartesian": L2LSHCartesian,
+    "l2ivf_cartesian": L2IVFCartesian,
     "l2lsh_single": L2LSHSingle,
     "l2lsh_joint": L2LSHJoint,
     "brute_force_cartesian": BruteForceCartesian,

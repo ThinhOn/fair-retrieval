@@ -55,6 +55,46 @@ synthetic data hides this. Source: `summary_bigann_{10k,1m,10m}.csv`.
 - SIFT 100% feasible at all ell; clustered synthetic feasibility rises 28.5%→99.5% with ell.
 - Use DAF (not recall@k) for distance quality on clustered data.
 
+## 4. IVF retrieval backend (Design A: one FAISS IVF index per Cartesian partition)
+
+IVF as a third retrieval family (reviewer R1O4/R1O8), plugged into the same
+framework — post-processing unchanged (retrieval-agnostic). The effort knob is
+`nprobe` (query-time; build once, sweep for free). nlist auto = 4·√n_π;
+partitions with <64 pts fall back to flat (exact). Module: `l2ivf_cartesian.py`,
+runner: `scripts/run_ivf_sweep.sh`. 200 queries with ground truth → recall + DAF.
+
+Real-world datasets, ℓ2, low config (nprobe 1/4/8):
+
+| dataset (m) | nprobe | recall@k | DAF | success% | search ms |
+|---|---:|---:|---:|---:|---:|
+| Audio (m=3)    | 1 | 0.644 | 1.092 | 100 | 1.9 |
+|                | 4 | 0.902 | 1.013 | 100 | 2.6 |
+|                | 8 | 0.972 | 1.003 | 100 | 2.7 |
+| CelebA (m=2)   | 1 | 0.647 | 1.032 | 100 | 229 |
+|                | 4 | 0.892 | 1.007 | 100 | 220 |
+|                | 8 | 0.957 | 1.002 | 100 | 220 |
+| FairFace (m=3) | 1 | 0.715 | 1.011 | 100 | 9.7 |
+|                | 4 | 0.978 | 1.000 | 100 | 8.2 |
+|                | 8 | 0.999 | 1.000 | 100 | 8.4 |
+
+(CelebA search is ~220 ms because metadata carries 5 attributes → 4^5=1024
+partitions, many probed per m=2 query.)
+
+Real-SIFT subset (1M, d=128, with ground truth) — IVF vs LSH at scale:
+
+| nprobe | recall@k | DAF | success% | search ms |
+|---:|---:|---:|---:|---:|
+| 1  | 0.407 | 1.111 | 100 | 5.4 |
+| 4  | 0.738 | 1.029 | 100 | 7.5 |
+| 8  | 0.858 | 1.013 | 100 | 7.6 |
+| 16 | 0.935 | 1.004 | 100 | 7.8 |
+| 32 | 0.976 | 1.001 | 100 | 8.1 |
+
+IVF reaches recall 0.976 on 1M SIFT vs LSH's 0.277 at ell=256 — data-adaptive
+k-means cells beat data-oblivious LSH on real (non-uniform) data, while
+post-processing stays 100% feasible. Source: `summary_ivf_*.csv`.
+(IVF was NOT run at billion scale per user request; would need IVFPQ for memory.)
+
 ## How to reproduce / re-run cheaply
 - Re-evaluate metrics (no querying): `python evaluate_ranged.py --results_dir outputs/<ds>/results_ranged_k=5_m=3_fdist=euclidean_<N> --queries_path data/<ds>/ranged_queries_k=5_m=3_fdist=euclidean_<N>.pkl --output summary.csv`
 - Re-run queries only (indexes already built): `python code/main.py --data-dir data/<ds> --index l2lsh_cartesian --w <800|4.0> --ell <ELL> --mu 2 --m 3 --solver ilp --use-cache` (build step is skipped — cached partitions are detected).
