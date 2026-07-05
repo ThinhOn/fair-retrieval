@@ -103,12 +103,12 @@ counterpart of the ranged m=2 above (generated with fast squared-L2 ground truth
 | 1 | 0.666 / 0.896 / 0.952 | 1.003 | 100.0 | 200 |
 | 3 | 0.801 / 0.957 / 0.982 | 1.001 | 98.5  | 200 |
 | 4 | 0.756 / 0.919 / 0.967 | 1.010 | 96.0  | 200 |
-| 5 | 0.755 / 0.898 / 0.932 | 1.005 | 72.7  | 132 |
+| 5 | 0.750 / 0.883 / 0.912 | 1.003 | 68.0  | 200 |
 
-Ranged success% (100/100/98.5/96/72.7 for m=1/2/3/4/5) is far higher than the
+Ranged success% (100/100/98.5/96/68.0 for m=1/2/3/4/5) is far higher than the
 exact-count version above (100/83.5/55/19) — ranged constraints are more flexible.
-DAF stays ~1.00 (near-optimal distance) throughout. m=5 yields only 132 feasible
-queries out of the candidate pool (ranged 5-attribute fairness is hard).
+DAF stays ~1.00 (near-optimal distance) throughout. All 200 queries per m (the
+generator now batches until `target` VALID queries are found — m=5 needed 2 rounds).
 Source: `summary_ivf_celeba_ranged_m={1,3,4,5}.csv`.
 
 Real-SIFT subset (1M, d=128, with ground truth) — IVF vs LSH at scale:

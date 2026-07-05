@@ -507,10 +507,18 @@ if __name__ == "__main__":
         attr_index, id2meta = build_attr_index(metadata_store)
 
     BATCH = 800
-    queries = []
-    seen = set()
+    MAX_ROUNDS = 60          # safety cap: generate up to 60*BATCH candidates
+    dfunc = get_dist_func(args.fdist)
+    args.solver = "ilp"
 
-    while len(queries) < args.target:
+    seen = set()
+    valid = []
+    n_precheck_pass = 0
+    round_i = 0
+    # Keep generating candidate batches until `target` VALID queries are found
+    # (a query is valid iff it passes precheck AND has a ground-truth solution).
+    while len(valid) < args.target and round_i < MAX_ROUNDS:
+        round_i += 1
         fresh = generate_complex_queries(
             attributes_dict,
             num_examples=BATCH,
@@ -519,60 +527,38 @@ if __name__ == "__main__":
             prob_options=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8],
         )
         for q in fresh:
-            # Stable signature using (lb, ub) tuples
             sig = (q['k'], tuple(sorted(
                 (attr, tuple(sorted(
-                    (val, lb, ub)
-                    for val, (lb, ub) in v.items()
+                    (val, lb, ub) for val, (lb, ub) in v.items()
                 )))
                 for attr, v in q['count'].items()
             )))
-            if sig not in seen:
-                seen.add(sig)
-                queries.append(q)
-        print(f"Accumulated {len(queries)} unique queries...")
+            if sig in seen:
+                continue
+            seen.add(sig)
 
-    dfunc = get_dist_func(args.fdist)
-
-    for query in tqdm.tqdm(queries):
-        idx = int(rng.integers(0, len(vector_store)))
-        query['vector'] = vector_store[idx]
-
-    # ── Pre-filter ────────────────────────────────────────────────────────────
-    prechecked = []
-    n_rejected = 0
-    for q in queries:
-        ok, reason = precheck_query(
-            q, df_meta, metadata_store,
-            attrs_memmap=attrs_memmap,
-            attr_counts=attr_counts,
-            partition_counts=partition_counts,
-            attr_index=attr_index,
-        )
-        if ok:
-            prechecked.append(q)
-        else:
-            n_rejected += 1
-    print(f"[Precheck] {len(prechecked)} passed / {n_rejected} rejected")
-    queries = prechecked
-
-    args.solver = "ilp"
-    count = 0
-    valid_query_idx = []
-    for idx, query in enumerate(tqdm.tqdm(queries, desc="Computing ground truth", unit="query")):
-        result = ground_truth_ilp(
-            query, vector_store, metadata_store, dfunc=dfunc, args=args,
-            attrs_memmap=attrs_memmap, attr_index=attr_index, id2meta=id2meta,
-        )
-        if result is None or result == (None, None):
-            continue
-        if 'ground_truth' in query:
-            count += 1
-            valid_query_idx.append(idx)
-            if count >= args.target:
+            q['vector'] = vector_store[int(rng.integers(0, len(vector_store)))]
+            ok, _ = precheck_query(
+                q, df_meta, metadata_store,
+                attrs_memmap=attrs_memmap, attr_counts=attr_counts,
+                partition_counts=partition_counts, attr_index=attr_index,
+            )
+            if not ok:
+                continue
+            n_precheck_pass += 1
+            result = ground_truth_ilp(
+                q, vector_store, metadata_store, dfunc=dfunc, args=args,
+                attrs_memmap=attrs_memmap, attr_index=attr_index, id2meta=id2meta,
+            )
+            if result is None or result == (None, None) or 'ground_truth' not in q:
+                continue
+            valid.append(q)
+            if len(valid) >= args.target:
                 break
+        print(f"[round {round_i}] valid {len(valid)}/{args.target} "
+              f"(precheck-pass so far {n_precheck_pass}, unique tried {len(seen)})")
 
-    queries = [queries[idx] for idx in valid_query_idx]
+    queries = valid[:args.target]
 
     print(f"Total final queries: {len(queries)}")
     # if queries:
