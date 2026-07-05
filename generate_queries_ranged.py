@@ -115,7 +115,8 @@ def precheck_query(query: dict, df_meta: pd.DataFrame,
                    metadata_store: np.ndarray,
                    attrs_memmap=None,
                    attr_counts: dict = None,
-                   partition_counts: dict = None) -> tuple[bool, str]:
+                   partition_counts: dict = None,
+                   attr_index: dict = None) -> tuple[bool, str]:
     """
     Fast structural feasibility check for ranged queries.
 
@@ -141,6 +142,9 @@ def precheck_query(query: dict, df_meta: pd.DataFrame,
             if attr_counts is not None:
                 # billion-scale: use pre-computed integer counts
                 available = attr_counts.get(attr, {}).get(val, 0)
+            elif attr_index is not None:
+                # standard fast path: index lookup
+                available = len(attr_index.get(f"{attr}:{val}", ()))
             else:
                 # standard: use DataFrame frequency table
                 if attr not in df_meta.columns:
@@ -186,6 +190,20 @@ def precheck_query(query: dict, df_meta: pd.DataFrame,
                     valid = False
                     break
             found = valid and partition_counts.get(tuple(code_key), 0) > 0
+        elif attr_index is not None:
+            # standard fast path: non-empty set intersection
+            sets = [attr_index.get(tok) for tok in tpl]
+            if not sets:
+                found = True                      # no mandatory tokens
+            elif any(not s for s in sets):
+                found = False
+            else:
+                acc = set(sets[0])
+                for s in sets[1:]:
+                    acc &= s
+                    if not acc:
+                        break
+                found = bool(acc)
         else:
             # standard: scan metadata strings
             found = any(
@@ -260,8 +278,23 @@ def _matching_ids_billion(tpl: tuple, attrs_memmap, chunk_size: int = 1_000_000)
     return np.concatenate(matched) if matched else np.array([], dtype=np.int64)
 
 
+def build_attr_index(metadata_store):
+    """One-pass index for the standard path: token 'attr:val' -> set(ids),
+    plus id -> metadata string. Lets ground-truth/precheck use set intersections
+    instead of rescanning all metadata strings per Cartesian tuple."""
+    attr_index = collections.defaultdict(set)
+    id2meta = {}
+    for m in metadata_store:
+        parts = str(m).split("__")
+        oid = int(parts[0].split(":")[1])
+        id2meta[oid] = m
+        for tok in parts[1:]:
+            attr_index[tok].add(oid)
+    return attr_index, id2meta
+
+
 def ground_truth_ilp(query, vector_store, metadata_store, dfunc, args,
-                     attrs_memmap=None):
+                     attrs_memmap=None, attr_index=None, id2meta=None):
     """
     Compute the ground-truth fair k-NN for a ranged query using the ILP solver.
 
@@ -294,8 +327,36 @@ def ground_truth_ilp(query, vector_store, metadata_store, dfunc, args,
                 (int(oid), float(dfunc(query['vector'], vector_store[int(oid)])))
                 for oid in match_ids
             ]
+        elif attr_index is not None:
+            # ── standard fast path: intersect id sets + vectorized distance ──
+            idsets = [attr_index.get(tok) for tok in tpl]
+            if any(not s for s in idsets):
+                per_tuple_topk.append([])
+                continue
+            mids = set(idsets[0])
+            for s in idsets[1:]:
+                mids &= s
+            if not mids:
+                per_tuple_topk.append([])
+                continue
+            mids = np.fromiter(mids, dtype=np.int64)
+            qv = np.asarray(query['vector'], dtype=np.float32)
+            X = np.asarray(vector_store[mids], dtype=np.float32)
+            if args.fdist == "cosine":
+                Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
+                dd = 1.0 - Xn @ (qv / (np.linalg.norm(qv) + 1e-12))
+            else:
+                # fdist "euclidean" => euclidean_dist_square (SQUARED L2), matching
+                # get_dist_func used by the framework. NOT sqrt — must be the same
+                # metric the search/objective use, or DAF is inconsistent.
+                diff = X - qv
+                dd = np.einsum("ij,ij->i", diff, diff)
+            order = np.argsort(dd)[: k * 2]
+            dists = [(int(mids[i]), float(dd[i])) for i in order]
+            per_tuple_topk.append(dists)
+            continue
         else:
-            # ── standard: string matching ─────────────────────────────────
+            # ── standard: string matching (slow fallback) ─────────────────
             matches = [m for m in metadata_store if all(tok in m for tok in tpl)]
             if not matches:
                 per_tuple_topk.append([])
@@ -326,7 +387,8 @@ def ground_truth_ilp(query, vector_store, metadata_store, dfunc, args,
             for oid, cost in id2best.items()
         ]
     else:
-        id2meta = {int(m.split('__')[0].split(':')[1]): m for m in metadata_store}
+        if id2meta is None:
+            id2meta = {int(m.split('__')[0].split(':')[1]): m for m in metadata_store}
         candidates = [
             (id2meta[oid], cost)
             for oid, cost in id2best.items()
@@ -387,6 +449,8 @@ if __name__ == "__main__":
                                  shape=(n_total, m_attrs))
         metadata_store = None
         df_meta        = None
+        attr_index     = None
+        id2meta        = None
 
         # attribute dict: {attr_name: [val_str, ...]}
         attributes_dict = {
@@ -417,6 +481,8 @@ if __name__ == "__main__":
         attrs_memmap     = None
         attr_counts      = None
         partition_counts = None
+        attr_index       = None
+        id2meta          = None
 
         npz_data = np.load(f'{PATH}/vectors.npz')
         vector_store, metadata_store = npz_data['vectors'], npz_data['metadata']
@@ -435,6 +501,10 @@ if __name__ == "__main__":
             k: df_meta[k].apply(lambda x: x.split(':')[1]).unique().tolist()
             for k in df_meta.columns
         }
+
+        # fast index for ground-truth (set intersections vs full metadata scans)
+        print("Building attribute index for fast ground truth ...")
+        attr_index, id2meta = build_attr_index(metadata_store)
 
     BATCH = 800
     queries = []
@@ -477,6 +547,7 @@ if __name__ == "__main__":
             attrs_memmap=attrs_memmap,
             attr_counts=attr_counts,
             partition_counts=partition_counts,
+            attr_index=attr_index,
         )
         if ok:
             prechecked.append(q)
@@ -491,7 +562,7 @@ if __name__ == "__main__":
     for idx, query in enumerate(tqdm.tqdm(queries, desc="Computing ground truth", unit="query")):
         result = ground_truth_ilp(
             query, vector_store, metadata_store, dfunc=dfunc, args=args,
-            attrs_memmap=attrs_memmap,
+            attrs_memmap=attrs_memmap, attr_index=attr_index, id2meta=id2meta,
         )
         if result is None or result == (None, None):
             continue

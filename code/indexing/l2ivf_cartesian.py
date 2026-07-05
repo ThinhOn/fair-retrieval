@@ -240,20 +240,11 @@ class L2IVFCartesian(L2LSHCartesian):
         if not len(final_cands):
             return None
 
+        # Always solve (ILP handles m=1 too): the simple m=1 counting path only
+        # works for exact counts (Σ=k); ranged m=1 (Σub>k) needs the solver to
+        # pick exactly k while satisfying lb<=count<=ub per value (Post-Alg-1).
         start = time.time()
-        if self.args.m > 1:
-            results = build_solver(self.args).solve(final_cands, query)
-        else:
-            count = {k: {v: 0 for v in reqs} for k, reqs in query['count'].items()}
-            for text, _ in final_cands:
-                for part in text.split("__"):
-                    if ":" not in part:
-                        continue
-                    key, val = part.split(":")
-                    if key in query['count'] and val in query['count'][key]:
-                        count[key][val] += 1
-            results = {'objective': sum(c[1] for c in final_cands),
-                       'selected': [c[0] for c in final_cands], 'count': count}
+        results = build_solver(self.args).solve(final_cands, query)
         postprocessing_time = time.time() - start
 
         results['search_time'] = search_time
